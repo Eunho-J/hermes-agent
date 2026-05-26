@@ -224,3 +224,19 @@ def test_deepseek_v4_pro_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48
+
+
+def test_normalize_usage_codex_exposes_total_tokens_for_context_management():
+    usage = SimpleNamespace(
+        input_tokens=3000,
+        output_tokens=50,
+        total_tokens=3050,
+        input_tokens_details=SimpleNamespace(cached_tokens=1000),
+    )
+
+    normalized = normalize_usage(usage, provider="openai-codex", api_mode="codex_responses")
+
+    assert normalized.input_tokens == 2000
+    assert normalized.cache_read_tokens == 1000
+    assert normalized.prompt_tokens == 3000
+    assert normalized.context_tokens == 3050

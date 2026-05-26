@@ -115,9 +115,9 @@ def test_openai_prompt_tokens_unchanged(monkeypatch):
     assert agent.context_compressor.last_prompt_tokens == 5000
 
 
-# -- Codex: no cache fields, getattr returns 0 --
+# -- Codex: context management follows response.completed usage.total_tokens --
 
-def test_codex_no_cache_fields(monkeypatch):
+def test_codex_context_uses_total_tokens_without_changing_input_accounting(monkeypatch):
     resp = lambda: SimpleNamespace(
         output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="ok")])],
         usage=SimpleNamespace(input_tokens=3000, output_tokens=50, total_tokens=3050),
@@ -125,4 +125,8 @@ def test_codex_no_cache_fields(monkeypatch):
     )
     agent = _make_agent(monkeypatch, "codex_responses", "openai-codex", resp)
     agent.run_conversation("hi")
-    assert agent.context_compressor.last_prompt_tokens == 3000
+    # Official Codex bases auto-compaction on response.completed
+    # TokenUsage.total_tokens, not only input_tokens.
+    assert agent.context_compressor.last_prompt_tokens == 3050
+    # Usage accounting remains input/prompt only.
+    assert agent.session_prompt_tokens == 3000

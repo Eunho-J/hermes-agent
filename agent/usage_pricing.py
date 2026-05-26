@@ -33,6 +33,11 @@ class CanonicalUsage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
+    # Provider-reported active context window occupancy for context management.
+    # For Codex Responses this is response.completed usage.total_tokens, matching
+    # official Codex's TokenUsage.total_tokens-based auto-compaction check.
+    # Leave 0 when a provider has no separate context-window signal.
+    context_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
 
@@ -691,6 +696,7 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    context_tokens = 0
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
@@ -700,6 +706,12 @@ def normalize_usage(
     elif mode == "codex_responses":
         input_total = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+        # Official Codex bases auto-compaction on TokenUsage.total_tokens
+        # from the response.completed event, then adds any local items
+        # produced after that model response.  Preserve that field separately
+        # from billable prompt/input buckets so context management can use the
+        # provider's active-window signal without distorting usage accounting.
+        context_tokens = _to_int(getattr(response_usage, "total_tokens", 0))
         details = getattr(response_usage, "input_tokens_details", None)
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
@@ -739,6 +751,7 @@ def normalize_usage(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        context_tokens=context_tokens,
     )
 
 

@@ -585,8 +585,10 @@ class TestToolResultPreflightCompression:
         """When tool results push estimated tokens past threshold, compress before next call."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
-        agent.context_compressor.threshold_tokens = 130_000  # below the 135k reported usage
-        agent.context_compressor.last_prompt_tokens = 130_000
+        agent.context_compressor.threshold_tokens = 130_000
+        # Regression: previous provider usage is below threshold, but the
+        # freshly appended tool result makes the next request too large.
+        agent.context_compressor.last_prompt_tokens = 120_000
         agent.context_compressor.last_completion_tokens = 5_000
 
         tc = SimpleNamespace(
@@ -595,7 +597,7 @@ class TestToolResultPreflightCompression:
         )
         tool_resp = _mock_response(
             content=None, finish_reason="stop", tool_calls=[tc],
-            usage={"prompt_tokens": 130_000, "completion_tokens": 5_000, "total_tokens": 135_000},
+            usage={"prompt_tokens": 120_000, "completion_tokens": 5_000, "total_tokens": 125_000},
         )
         ok_resp = _mock_response(
             content="Done after compression", finish_reason="stop",
@@ -606,6 +608,7 @@ class TestToolResultPreflightCompression:
 
         with (
             patch("run_agent.handle_function_call", return_value=large_result),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=140_000),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -617,6 +620,7 @@ class TestToolResultPreflightCompression:
             result = agent.run_conversation("hello")
 
         mock_compress.assert_called_once()
+        assert mock_compress.call_args.kwargs["approx_tokens"] == 140_000
         assert result["completed"] is True
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):

@@ -1667,10 +1667,17 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    # Context-window occupancy is not always identical to
+                    # billable prompt/input tokens.  Codex Responses reports
+                    # response.completed usage.total_tokens, and official Codex
+                    # uses that field for auto-compaction state.  Track it in
+                    # the compressor/status path while keeping prompt_tokens for
+                    # usage accounting and cache-hit percentages.
+                    context_tokens = canonical_usage.context_tokens or prompt_tokens
                     usage_dict = {
-                        "prompt_tokens": prompt_tokens,
+                        "prompt_tokens": context_tokens,
                         "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
+                        "total_tokens": max(context_tokens, total_tokens),
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
@@ -1699,11 +1706,14 @@ def run_conversation(
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    _ctx_suffix = ""
+                    if context_tokens and context_tokens != prompt_tokens:
+                        _ctx_suffix = f" ctx={context_tokens}"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration, _cache_pct, _ctx_suffix,
                     )
 
                     cost_result = estimate_usage_cost(
@@ -1763,7 +1773,11 @@ def run_conversation(
                             )
                     
                     if agent.verbose_logging:
-                        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
+                        logging.debug(
+                            f"Token usage: prompt={prompt_tokens:,}, "
+                            f"completion={completion_tokens:,}, total={total_tokens:,}, "
+                            f"context={usage_dict['prompt_tokens']:,}"
+                        )
                     
                     # Surface cache hit stats for any provider that reports
                     # them — not just those where we inject cache_control
@@ -1778,7 +1792,7 @@ def run_conversation(
                     # so we can rely on its values directly.
                     cached = canonical_usage.cache_read_tokens
                     written = canonical_usage.cache_write_tokens
-                    prompt = usage_dict["prompt_tokens"]
+                    prompt = prompt_tokens
                     if (cached or written) and not agent.quiet_mode:
                         hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                         agent._vprint(
@@ -3570,42 +3584,28 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
-                #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
+                # Decide whether to compact before the next follow-up
+                # model request.  Official Codex keeps a server-observed
+                # context counter from response.completed usage.total_tokens
+                # AND adds local items appended after the last model response
+                # (notably tool outputs) before mid-turn auto-compaction.
+                # Mirror that shape by taking the larger of the provider's
+                # last context signal and a fresh rough estimate of the actual
+                # next request payload after tool results were appended.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
-                    )
+                _post_tool_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                _provider_context_tokens = max(0, _compressor.last_prompt_tokens or 0)
+                _real_tokens = max(_provider_context_tokens, _post_tool_tokens)
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
+                        approx_tokens=_real_tokens,
                         task_id=effective_task_id,
                     )
                     # Compression created a new session — clear history so
