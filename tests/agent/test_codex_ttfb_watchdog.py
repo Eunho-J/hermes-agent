@@ -95,6 +95,8 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
             h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
         elapsed = time.time() - t0
         assert "TTFB" in str(excinfo.value)
+        assert getattr(excinfo.value, "is_codex_ttfb_timeout", False)
+        assert "connection closed" not in str(excinfo.value)
         assert "codex_ttfb_kill" in closes
         # ~1s cutoff + 2s join grace; must be far under the 60s stale timeout.
         assert elapsed < 15, f"TTFB watchdog took {elapsed:.1f}s"
@@ -138,6 +140,44 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
+
+
+def test_create_stream_fallback_marks_first_event(tmp_path, monkeypatch):
+    """The Responses create(stream=True) fallback must update the same
+    first-event marker as the primary stream path. Otherwise the TTFB
+    watchdog can kill an active fallback stream while events are flowing."""
+    from agent.codex_runtime import run_codex_create_stream_fallback
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent._codex_stream_last_event_ts = None
+
+    class FakeTransport:
+        def preflight_kwargs(self, kwargs, allow_stream=False):
+            return kwargs
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            terminal = SimpleNamespace(output=[])
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="hello"),
+                    SimpleNamespace(type="response.completed", response=terminal),
+                ]
+            )
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    monkeypatch.setattr(agent, "_get_transport", lambda: FakeTransport())
+
+    response = run_codex_create_stream_fallback(
+        agent,
+        {"model": "gpt-5.5", "input": "hi"},
+        client=fake_client,
+    )
+
+    assert agent._codex_stream_last_event_ts is not None
+    assert response.output
+    assert response.output[0].content[0].text == "hello"
 
 
 def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):

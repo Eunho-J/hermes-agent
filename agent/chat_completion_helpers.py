@@ -65,6 +65,12 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+class CodexNoFirstByteError(TimeoutError):
+    """Codex Responses stream accepted a request but emitted no events."""
+
+    is_codex_ttfb_timeout = True
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -145,6 +151,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     result = {"response": None, "error": None}
+    forced_error = {"error": None}
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
 
@@ -244,7 +251,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
-            result["error"] = e
+            # If the watchdog already classified the failure, preserve that
+            # semantic error instead of letting the worker's transport abort
+            # (often APIConnectionError / RuntimeError("connection closed"))
+            # overwrite it.
+            result["error"] = forced_error["error"] or e
         finally:
             _close_request_client_once("request_complete")
 
@@ -325,6 +336,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                 f"Reconnecting."
             )
+            _silent_hint: Optional[str] = None
+            _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
+            if callable(_hint_fn):
+                try:
+                    _silent_hint = _hint_fn(model=api_kwargs.get("model"))
+                except Exception:
+                    _silent_hint = None
+            _ttfb_msg = (
+                f"Codex stream produced no bytes within {int(_elapsed)}s "
+                f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+            )
+            if _silent_hint:
+                _ttfb_msg = f"{_ttfb_msg}. {_silent_hint}"
+            _ttfb_error = CodexNoFirstByteError(_ttfb_msg)
+            forced_error["error"] = _ttfb_error
+            result["error"] = _ttfb_error
             try:
                 _close_request_client_once("codex_ttfb_kill")
             except Exception:
@@ -335,7 +362,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
+                result["error"] = forced_error["error"] or CodexNoFirstByteError(
                     f"Codex stream produced no bytes within {int(_elapsed)}s "
                     f"(TTFB threshold: {int(_ttfb_timeout)}s)"
                 )
@@ -2301,6 +2328,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
 
 __all__ = [
+    "CodexNoFirstByteError",
     "interruptible_api_call",
     "build_api_kwargs",
     "build_assistant_message",

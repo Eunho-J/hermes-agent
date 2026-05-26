@@ -357,7 +357,10 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
     collected_text_deltas: list = []
     try:
         for event in stream_or_response:
+            agent._codex_stream_last_event_ts = time.time()
             agent._touch_activity("receiving stream response")
+            if getattr(agent, "_interrupt_requested", False):
+                raise InterruptedError("Agent interrupted during Codex fallback stream")
             event_type = getattr(event, "type", None)
             if not event_type and isinstance(event, dict):
                 event_type = event.get("type")

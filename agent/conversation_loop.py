@@ -2347,6 +2347,10 @@ def run_conversation(
                 
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
+                _is_codex_ttfb_timeout = bool(
+                    getattr(api_error, "is_codex_ttfb_timeout", False)
+                    or "codex stream produced no bytes" in error_msg
+                )
                 _error_summary = agent._summarize_api_error(api_error)
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
@@ -2945,8 +2949,14 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not primary_recovery_attempted and agent._try_recover_primary_transport(
-                        api_error, retry_count=retry_count, max_retries=max_retries,
+                    if (
+                        not _is_codex_ttfb_timeout
+                        and not primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
+                            api_error,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                        )
                     ):
                         primary_recovery_attempted = True
                         retry_count = 0
