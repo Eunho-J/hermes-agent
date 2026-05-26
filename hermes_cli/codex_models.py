@@ -75,9 +75,13 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority."""
     try:
         import httpx
+        from agent.auxiliary_client import _codex_cloudflare_headers
+
+        headers = _codex_cloudflare_headers(access_token)
+        headers["Authorization"] = f"Bearer {access_token}"
         resp = httpx.get(
             "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers=headers,
             timeout=10,
         )
         if resp.status_code != 200:

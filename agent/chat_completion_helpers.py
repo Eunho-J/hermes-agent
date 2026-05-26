@@ -33,7 +33,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlunparse
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_codex_ttfb_timeout,
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.model_metadata import is_local_endpoint
@@ -281,12 +285,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # non-stream, anthropic and bedrock branches here have no first-event
     # signal). The marker advances on *any* event (see codex_runtime), so
     # reasoning-only / tool-call-only turns are not mistaken for a stall.
-    # Operators can tune via HERMES_CODEX_TTFB_TIMEOUT_SECONDS (0 disables).
+    # Operators can tune via providers.<id>.codex_ttfb_timeout_seconds,
+    # providers.<id>.models.<model>.codex_ttfb_timeout_seconds, or the legacy
+    # HERMES_CODEX_TTFB_TIMEOUT_SECONDS env var. A value of 0 disables.
     _ttfb_enabled = agent.api_mode == "codex_responses"
-    try:
-        _ttfb_timeout = float(os.getenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "45"))
-    except (TypeError, ValueError):
-        _ttfb_timeout = 45.0
+    _ttfb_cfg = get_provider_codex_ttfb_timeout(agent.provider, agent.model)
+    if _ttfb_cfg is not None:
+        _ttfb_timeout = _ttfb_cfg
+    else:
+        try:
+            _ttfb_timeout = float(os.getenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "45"))
+        except (TypeError, ValueError):
+            _ttfb_timeout = 45.0
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     if _ttfb_enabled:
@@ -295,7 +305,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
         agent._codex_stream_last_event_ts = None
 
     _call_start = time.time()
-    agent._touch_activity("waiting for non-streaming API response")
+    if agent.api_mode == "codex_responses":
+        agent._touch_activity("waiting for Codex stream response")
+    else:
+        agent._touch_activity("waiting for non-streaming API response")
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -308,9 +321,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # monitor knows we're alive while waiting for the response.
         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
             _elapsed = time.time() - _call_start
-            agent._touch_activity(
-                f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
-            )
+            if agent.api_mode == "codex_responses":
+                agent._touch_activity(
+                    f"waiting for Codex stream response ({int(_elapsed)}s elapsed)"
+                )
+            else:
+                agent._touch_activity(
+                    f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
+                )
 
         _elapsed = time.time() - _call_start
 
@@ -379,24 +397,34 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = _hint_fn(model=api_kwargs.get("model"))
                 except Exception:
                     _silent_hint = None
-            logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
-            if _silent_hint:
-                agent._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"{_silent_hint}"
+            if agent.api_mode == "codex_responses":
+                logger.warning(
+                    "Codex Responses stream stale for %.0fs (threshold %.0fs). "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _elapsed, _stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
             else:
-                agent._emit_status(
+                logger.warning(
+                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _elapsed, _stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+            if agent.api_mode == "codex_responses":
+                _stale_status_prefix = (
+                    f"⚠️ No Codex stream event from provider for {int(_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). "
+                )
+            else:
+                _stale_status_prefix = (
                     f"⚠️ No response from provider for {int(_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
                 )
+            if _silent_hint:
+                agent._emit_status(f"{_stale_status_prefix}{_silent_hint}")
+            else:
+                agent._emit_status(f"{_stale_status_prefix}Aborting call.")
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()
@@ -405,23 +433,43 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _close_request_client_once("stale_call_kill")
             except Exception:
                 pass
-            agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
-            )
+            if agent.api_mode == "codex_responses":
+                agent._touch_activity(
+                    f"stale Codex stream killed after {int(_elapsed)}s"
+                )
+            else:
+                agent._touch_activity(
+                    f"stale non-streaming call killed after {int(_elapsed)}s"
+                )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
+                    if agent.api_mode == "codex_responses":
+                        _timeout_msg = (
+                            f"Codex stream timed out after {int(_elapsed)}s "
+                            f"with no events (threshold: {int(_stale_timeout)}s). "
+                            f"{_silent_hint}"
+                        )
+                    else:
+                        _timeout_msg = (
+                            f"Non-streaming API call timed out after {int(_elapsed)}s "
+                            f"with no response (threshold: {int(_stale_timeout)}s). "
+                            f"{_silent_hint}"
+                        )
+                    result["error"] = TimeoutError(_timeout_msg)
                 else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+                    if agent.api_mode == "codex_responses":
+                        _timeout_msg = (
+                            f"Codex stream timed out after {int(_elapsed)}s "
+                            f"with no events (threshold: {int(_stale_timeout)}s)"
+                        )
+                    else:
+                        _timeout_msg = (
+                            f"Non-streaming API call timed out after {int(_elapsed)}s "
+                            f"with no response (threshold: {int(_stale_timeout)}s)"
+                        )
+                    result["error"] = TimeoutError(_timeout_msg)
             break
 
         if agent._interrupt_requested:

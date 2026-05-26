@@ -180,6 +180,47 @@ def test_create_stream_fallback_marks_first_event(tmp_path, monkeypatch):
     assert response.output[0].content[0].text == "hello"
 
 
+def test_ttfb_disabled_via_config_zero(tmp_path, monkeypatch):
+    """providers.openai-codex.codex_ttfb_timeout_seconds=0 disables the
+    first-byte watchdog without relying on an environment variable."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        """
+providers:
+  openai-codex:
+    codex_ttfb_timeout_seconds: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        time.sleep(2.0)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert resp is sentinel
+    assert "codex_ttfb_kill" not in closes
+
+
 def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
     """Setting HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 disables the TTFB watchdog;
     a no-event stall then falls through to the (here, 60s) stale timeout, so a

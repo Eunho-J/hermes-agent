@@ -96,15 +96,22 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
                 ]
             }
 
+    captured = {}
+
     class _FakeHttpx:
         @staticmethod
         def get(url, headers=None, timeout=None):
+            captured["headers"] = headers or {}
             return _FakeResp()
 
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
+    assert captured["headers"]["Authorization"] == "Bearer tok"
+    assert captured["headers"]["originator"] == "codex_cli_rs"
+    assert captured["headers"]["User-Agent"].startswith("codex_cli_rs/")
+    assert "version" in captured["headers"]
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models

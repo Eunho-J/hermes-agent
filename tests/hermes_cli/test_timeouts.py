@@ -3,6 +3,7 @@ from __future__ import annotations
 import textwrap
 
 from hermes_cli.timeouts import (
+    get_provider_codex_ttfb_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -74,6 +75,38 @@ def test_provider_stale_timeout_used_when_no_model_override(monkeypatch, tmp_pat
     assert get_provider_stale_timeout("openai-codex", "gpt-5.4") == 900.0
 
 
+def test_codex_ttfb_timeout_allows_provider_zero_disable(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          openai-codex:
+            codex_ttfb_timeout_seconds: 0
+        """,
+    )
+
+    assert get_provider_codex_ttfb_timeout("openai-codex", "gpt-5.5") == 0.0
+
+
+def test_codex_ttfb_model_override_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          openai-codex:
+            codex_ttfb_timeout_seconds: 45
+            models:
+              gpt-5.5:
+                codex_ttfb_timeout_seconds: 300
+        """,
+    )
+
+    assert get_provider_codex_ttfb_timeout("openai-codex", "gpt-5.5") == 300.0
+    assert get_provider_codex_ttfb_timeout("openai-codex", "gpt-5.4") == 45.0
+
+
 def test_missing_timeout_returns_none(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_config(
@@ -89,6 +122,7 @@ def test_missing_timeout_returns_none(monkeypatch, tmp_path):
 
     assert get_provider_request_timeout("anthropic", "claude-opus-4.6") is None
     assert get_provider_request_timeout("missing-provider", "claude-opus-4.6") is None
+    assert get_provider_codex_ttfb_timeout("missing-provider", "gpt-5.5") is None
 
 
 def test_invalid_timeout_values_return_none(monkeypatch, tmp_path):
@@ -110,6 +144,7 @@ def test_invalid_timeout_values_return_none(monkeypatch, tmp_path):
     assert get_provider_request_timeout("anthropic", "claude-opus-4.6") is None
     assert get_provider_request_timeout("anthropic", "claude-sonnet-4.5") is None
     assert get_provider_request_timeout("ollama-local") is None
+    assert get_provider_codex_ttfb_timeout("anthropic", "claude-opus-4.6") is None
 
 
 def test_invalid_stale_timeout_values_return_none(monkeypatch, tmp_path):

@@ -928,26 +928,14 @@ class AIAgent:
         return stale_base
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
-        """Return an actionable hint when this request matches a known
-        Codex silent-reject configuration, else ``None``.
+        """Return a cautious hint for Codex OAuth no-event stalls.
 
-        The ChatGPT Codex backend (``chatgpt.com/backend-api/codex``) has
-        historically silently dropped certain model requests: the connection
-        is accepted but no stream events are emitted and no error is raised.
-        The stale-call detector ends the hang, but a generic "timed out"
-        message gives the user no path forward.
-
-        This helper substitutes an actionable hint into the stale-timeout
-        warning when the request matches a known silent-reject pattern.
-        Currently flagged: ``gpt-5.5`` family on the Codex backend.  See
-        hermes-agent #21444 for the symptom history.  The upstream backend
-        behavior has historically come and gone with ChatGPT entitlement
-        changes — the heuristic stays in place as future-proofing even when
-        the symptom is dormant.
-
-        Does NOT fix the backend issue.  Only converts an opaque stale-timeout
-        into actionable text so users learn the workaround in seconds rather
-        than digging through logs.
+        The ChatGPT Codex backend (``chatgpt.com/backend-api/codex``) can accept
+        a request but then emit no Responses stream events. Hermes cannot infer
+        from the timeout alone whether the cause is model rollout/entitlement,
+        backend load, or a client/header/transport mismatch, so this helper must
+        avoid account-plan-specific claims. It only adds a practical recovery
+        hint for the historically sensitive ``gpt-5.5`` family.
         """
         if self.api_mode != "codex_responses":
             return None
@@ -969,13 +957,14 @@ class AIAgent:
         if not re.search(r"(?:^|[/\-_])gpt-5\.5(?:$|[\-_])", model_lower):
             return None
         return (
-            f"Codex backend appears to be silently rejecting {eff_model!r} "
-            "on chatgpt.com/backend-api/codex (no stream events, no error). "
-            "This is a known backend-side pattern that has affected ChatGPT "
-            "Plus accounts intermittently. "
-            "Workaround: try `gpt-5.4-codex` on the same OAuth profile, "
-            "or switch to a different model/provider in your fallback chain. "
-            "See hermes-agent#21444 for symptom history."
+            f"Codex OAuth backend emitted no stream events for {eff_model!r} "
+            "on chatgpt.com/backend-api/codex. This can be caused by a "
+            "temporary backend stall, model rollout/entitlement mismatch, or "
+            "client transport/header divergence from the official Codex CLI. "
+            "Verify the active OAuth profile's `/backend-api/codex/models` "
+            "response; if the model is absent, pick a listed model such as "
+            "`gpt-5.4`. If it is present, raise the Codex TTFB/stale timeouts "
+            "or switch to another configured fallback provider."
         )
 
     def _is_openrouter_url(self) -> bool:
