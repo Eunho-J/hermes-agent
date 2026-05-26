@@ -441,7 +441,9 @@ _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
-def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
+def _codex_cloudflare_headers(
+    access_token: str, client_version: str | None = None
+) -> Dict[str, str]:
     """Headers required to avoid Cloudflare 403s on chatgpt.com/backend-api/codex.
 
     The Cloudflare layer in front of the Codex endpoint whitelists a small set of
@@ -459,10 +461,14 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
     raise, so a bad token still surfaces as an auth error (401) instead of a
     crash at client construction.
     """
+    if not client_version:
+        from hermes_cli.codex_client_version import resolve_codex_client_version
+
+        client_version = resolve_codex_client_version()
     headers = {
-        "User-Agent": f"codex_cli_rs/{_HERMES_VERSION} (Hermes Agent)",
+        "User-Agent": f"codex_cli_rs/{client_version} (Hermes Agent)",
         "originator": "codex_cli_rs",
-        "version": _HERMES_VERSION,
+        "version": client_version,
     }
     if not isinstance(access_token, str) or not access_token.strip():
         return headers

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import os
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,14 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
     try:
         import httpx
         from agent.auxiliary_client import _codex_cloudflare_headers
+        from hermes_cli.codex_client_version import resolve_codex_client_version
 
-        headers = _codex_cloudflare_headers(access_token)
+        client_version = resolve_codex_client_version()
+        headers = _codex_cloudflare_headers(access_token, client_version=client_version)
         headers["Authorization"] = f"Bearer {access_token}"
         resp = httpx.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+            "https://chatgpt.com/backend-api/codex/models"
+            f"?client_version={quote(client_version)}",
             headers=headers,
             timeout=10,
         )

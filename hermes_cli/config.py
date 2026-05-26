@@ -3196,7 +3196,8 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "codex_ttfb_timeout_seconds", "discover_models", "extra_body",
+        "codex_ttfb_timeout_seconds", "codex_client_version",
+        "codex_client_version_ttl_hours", "discover_models", "extra_body",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:

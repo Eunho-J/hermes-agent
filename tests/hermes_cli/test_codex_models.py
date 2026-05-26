@@ -101,13 +101,16 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     class _FakeHttpx:
         @staticmethod
         def get(url, headers=None, timeout=None):
+            captured["url"] = url
             captured["headers"] = headers or {}
             return _FakeResp()
 
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    monkeypatch.setenv("HERMES_CODEX_CLIENT_VERSION", "0.133.0")
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
+    assert "client_version=0.133.0" in captured["url"]
     assert captured["headers"]["Authorization"] == "Bearer tok"
     assert captured["headers"]["originator"] == "codex_cli_rs"
     assert captured["headers"]["User-Agent"].startswith("codex_cli_rs/")

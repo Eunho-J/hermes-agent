@@ -36,6 +36,12 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _pin_codex_client_version(monkeypatch):
+    monkeypatch.setenv("HERMES_CODEX_CLIENT_VERSION", "0.133.0")
+
+
 def _make_codex_jwt(account_id: str = "acct-test-123") -> str:
     """Build a syntactically valid Codex-style JWT with the account_id claim."""
     def b64url(data: bytes) -> str:
@@ -68,7 +74,8 @@ class TestCodexCloudflareHeaders:
     def test_user_agent_advertises_codex_cli_rs(self):
         from agent.auxiliary_client import _codex_cloudflare_headers
         headers = _codex_cloudflare_headers(_make_codex_jwt())
-        assert headers["User-Agent"].startswith("codex_cli_rs/")
+        assert headers["User-Agent"].startswith("codex_cli_rs/0.133.0")
+        assert headers["version"] == "0.133.0"
 
     def test_account_id_extracted_from_jwt(self):
         from agent.auxiliary_client import _codex_cloudflare_headers
