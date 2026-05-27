@@ -27,6 +27,7 @@ class ResponsesApiTransport(ProviderTransport):
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=bool(kwargs.get("is_xai_responses")),
+            replay_encrypted_reasoning=bool(kwargs.get("replay_encrypted_reasoning", True)),
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -79,6 +80,14 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
+        replay_encrypted_reasoning = params.get("replay_encrypted_reasoning")
+        if replay_encrypted_reasoning is None:
+            # ChatGPT's Codex backend has its own authenticated session state
+            # and can stall before sending headers when old encrypted
+            # reasoning blobs are replayed. Other Responses-compatible
+            # transports, especially xAI OAuth, still require replay for
+            # cross-turn coherence.
+            replay_encrypted_reasoning = not is_codex_backend
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -100,6 +109,7 @@ class ResponsesApiTransport(ProviderTransport):
             "input": _chat_messages_to_responses_input(
                 payload_messages,
                 is_xai_responses=is_xai_responses,
+                replay_encrypted_reasoning=bool(replay_encrypted_reasoning),
             ),
             "store": False,
         }

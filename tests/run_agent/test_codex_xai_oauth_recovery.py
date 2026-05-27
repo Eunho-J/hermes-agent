@@ -305,7 +305,7 @@ def _assistant_msg_with_encrypted_reasoning(text="hi from grok", encrypted="enc_
 
 
 def test_codex_reasoning_replay_default_includes_encrypted_content():
-    """Native Codex backend (default) must still replay encrypted reasoning."""
+    """Generic Responses conversion still replays encrypted reasoning."""
     from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
     msgs = [
@@ -318,6 +318,28 @@ def test_codex_reasoning_replay_default_includes_encrypted_content():
     reasoning = [it for it in items if it.get("type") == "reasoning"]
     assert len(reasoning) == 1
     assert reasoning[0]["encrypted_content"] == "enc_blob"
+
+
+def test_codex_reasoning_replay_can_be_disabled_for_native_codex():
+    """ChatGPT Codex transport can opt out of replaying stale reasoning blobs."""
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    msgs = [
+        {"role": "user", "content": "hi"},
+        _assistant_msg_with_encrypted_reasoning(),
+        {"role": "user", "content": "what's your name?"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        msgs,
+        replay_encrypted_reasoning=False,
+    )
+    reasoning = [it for it in items if it.get("type") == "reasoning"]
+    assert reasoning == []
+    assert any(
+        it.get("role") == "assistant" or it.get("type") == "message"
+        for it in items
+    )
 
 
 def test_codex_reasoning_replay_includes_encrypted_content_for_xai():
@@ -400,8 +422,8 @@ def test_codex_transport_xai_replays_reasoning_in_input():
     assert reasoning_items[0]["encrypted_content"] == "enc_blob"
 
 
-def test_codex_transport_native_codex_still_replays_reasoning_in_input():
-    """Regression guard: openai-codex must keep the existing replay path."""
+def test_codex_transport_native_codex_skips_reasoning_replay_in_input():
+    """openai-codex skips replay to avoid no-header Codex backend stalls."""
     from agent.transports.codex import ResponsesApiTransport
 
     transport = ResponsesApiTransport()
@@ -416,14 +438,39 @@ def test_codex_transport_native_codex_still_replays_reasoning_in_input():
         tools=None,
         instructions="sys",
         reasoning_config={"enabled": True, "effort": "medium"},
+        is_codex_backend=True,
+        is_xai_responses=False,
+    )
+    input_items = kwargs["input"]
+    reasoning_items = [it for it in input_items if it.get("type") == "reasoning"]
+    assert reasoning_items == []
+    # Native Codex still asks for encrypted_content back.
+    assert "reasoning.encrypted_content" in kwargs.get("include", [])
+
+
+def test_codex_transport_custom_responses_still_replays_reasoning_in_input():
+    """Custom Responses relays keep the historical encrypted replay path."""
+    from agent.transports.codex import ResponsesApiTransport
+
+    transport = ResponsesApiTransport()
+    kwargs = transport.build_kwargs(
+        model="custom-reasoning-model",
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            _assistant_msg_with_encrypted_reasoning(text="hi from relay"),
+            {"role": "user", "content": "next"},
+        ],
+        tools=None,
+        instructions="sys",
+        reasoning_config={"enabled": True, "effort": "medium"},
+        is_codex_backend=False,
         is_xai_responses=False,
     )
     input_items = kwargs["input"]
     reasoning_items = [it for it in input_items if it.get("type") == "reasoning"]
     assert len(reasoning_items) == 1
     assert reasoning_items[0]["encrypted_content"] == "enc_blob"
-    # Native Codex still asks for encrypted_content back.
-    assert "reasoning.encrypted_content" in kwargs.get("include", [])
 
 
 # ---------------------------------------------------------------------------

@@ -248,19 +248,25 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
     is_xai_responses: bool = False,
+    replay_encrypted_reasoning: bool = True,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
     ``is_xai_responses`` is kept for transport signature compatibility but
-    no longer suppresses encrypted reasoning replay.  Earlier (PR #26644,
-    May 2026) we believed xAI's OAuth/SuperGrok ``/v1/responses`` surface
-    rejected replayed ``encrypted_content`` reasoning items minted by
-    prior turns, and we stripped them.  That decision was wrong — xAI
-    explicitly relies on Hermes threading encrypted reasoning back across
-    turns for cross-turn coherence (the whole point of their partnership
-    integration).  We now replay encrypted reasoning on every Responses
-    transport (xAI, native Codex, custom relays) and let xAI tell us
-    explicitly if a specific surface ever rejects a payload.
+    no longer suppresses encrypted reasoning replay by itself.  Earlier
+    (PR #26644, May 2026) we believed xAI's OAuth/SuperGrok
+    ``/v1/responses`` surface rejected replayed ``encrypted_content``
+    reasoning items minted by prior turns, and we stripped them.  That
+    decision was wrong — xAI explicitly relies on Hermes threading encrypted
+    reasoning back across turns for cross-turn coherence (the whole point of
+    their partnership integration).
+
+    ``replay_encrypted_reasoning`` is the transport-owned compatibility gate.
+    The ChatGPT Codex backend can silently stall before response headers when
+    old encrypted reasoning blobs are replayed in large tool-heavy sessions;
+    that backend already tracks server-side reasoning/accounting for the
+    authenticated Codex session, so the transport disables replay there while
+    keeping it available for xAI and custom Responses relays that require it.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -287,12 +293,12 @@ def _chat_messages_to_responses_input(
             if role == "assistant":
                 # Replay encrypted reasoning items from previous turns
                 # so the API can maintain coherent reasoning chains.
-                # This applies to every Responses transport including
-                # xAI — see _chat_messages_to_responses_input docstring
-                # for the May 2026 reversal of the earlier xAI gate.
+                # The caller may disable this for backends (notably ChatGPT
+                # Codex) that already maintain server-side reasoning state or
+                # reject/stall on replayed blobs.
                 codex_reasoning = msg.get("codex_reasoning_items")
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list):
+                if replay_encrypted_reasoning and isinstance(codex_reasoning, list):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
