@@ -86,6 +86,65 @@ def _is_codex_missing_output_type_error(exc: TypeError) -> bool:
     return "NoneType" in text and "iterable" in text
 
 
+def _build_recovered_codex_stream_response(
+    *,
+    api_kwargs: dict,
+    collected_output_items: list,
+    streamed_text_parts: list,
+    has_tool_calls: bool,
+    terminal_status: str | None = None,
+    final_response: Any = None,
+    reason: str,
+):
+    """Recover usable output already seen before SDK final parsing failed.
+
+    ChatGPT Codex can stream valid deltas/items and then emit a terminal
+    response whose ``output`` is null. Some openai-python versions surface that
+    as ``TypeError: 'NoneType' object is not iterable`` either while iterating
+    the stream or when ``get_final_response()`` parses the terminal object. In
+    that case, do not replay the whole request: return the streamed output that
+    Hermes has already captured.
+    """
+    status = terminal_status or getattr(final_response, "status", None) or "completed"
+    model = getattr(final_response, "model", None) or api_kwargs.get("model")
+    usage = getattr(final_response, "usage", None)
+
+    if collected_output_items:
+        logger.debug(
+            "Codex stream: recovered %d output items after %s",
+            len(collected_output_items),
+            reason,
+        )
+        return SimpleNamespace(
+            status=status,
+            model=model,
+            usage=usage,
+            output=list(collected_output_items),
+            output_text="".join(streamed_text_parts) or getattr(final_response, "output_text", None),
+        )
+
+    if status in {"failed", "cancelled", "incomplete"}:
+        return None
+
+    if streamed_text_parts and not has_tool_calls:
+        assembled = "".join(streamed_text_parts)
+        logger.debug(
+            "Codex stream: recovered from %d text deltas after %s (%d chars)",
+            len(streamed_text_parts),
+            reason,
+            len(assembled),
+        )
+        return SimpleNamespace(
+            status=status,
+            model=model,
+            usage=usage,
+            output=[_codex_synthetic_message(assembled)],
+            output_text=assembled,
+        )
+
+    return None
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -256,9 +315,31 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         collected_output_items: list = []
+        terminal_status: str | None = None
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
-                for event in stream:
+                stream_iter = iter(stream)
+                while True:
+                    try:
+                        event = next(stream_iter)
+                    except StopIteration:
+                        break
+                    except TypeError as exc:
+                        # openai-python may raise while parsing a final SSE
+                        # frame whose response.output is null after Hermes has
+                        # already collected valid streamed deltas/items.
+                        if _is_codex_missing_output_type_error(exc):
+                            recovered = _build_recovered_codex_stream_response(
+                                api_kwargs=api_kwargs,
+                                collected_output_items=collected_output_items,
+                                streamed_text_parts=agent._codex_streamed_text_parts,
+                                has_tool_calls=has_tool_calls,
+                                terminal_status=terminal_status,
+                                reason="SDK stream parser saw response.output=None",
+                            )
+                            if recovered is not None:
+                                return recovered
+                        raise
                     # Mark stream activity for the TTFB watchdog in
                     # interruptible_api_call. The Codex backend can accept the
                     # connection but never emit a single event; this timestamp
@@ -302,6 +383,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     elif event_type in {"response.incomplete", "response.failed"}:
                         resp_obj = getattr(event, "response", None)
                         status = getattr(resp_obj, "status", None) if resp_obj else None
+                        terminal_status = status or event_type.removeprefix("response.")
                         incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
                         logger.warning(
                             "Codex Responses stream received terminal event %s "
@@ -310,10 +392,43 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             sum(len(p) for p in agent._codex_streamed_text_parts),
                             agent._client_log_context(),
                         )
-                final_response = stream.get_final_response()
+                try:
+                    final_response = stream.get_final_response()
+                except TypeError as exc:
+                    # Some SDK versions defer final Responses-object parsing
+                    # until get_final_response(), so the same output=None
+                    # terminal payload can fail here after iteration ends.
+                    if _is_codex_missing_output_type_error(exc):
+                        recovered = _build_recovered_codex_stream_response(
+                            api_kwargs=api_kwargs,
+                            collected_output_items=collected_output_items,
+                            streamed_text_parts=agent._codex_streamed_text_parts,
+                            has_tool_calls=has_tool_calls,
+                            terminal_status=terminal_status,
+                            reason="SDK final response parser saw response.output=None",
+                        )
+                        if recovered is not None:
+                            return recovered
+                    raise
                 # PATCH: ChatGPT Codex backend streams valid output items
                 # but get_final_response() can return an empty output list.
                 # Backfill from collected items or synthesize from deltas.
+                recovered = None
+                _out = getattr(final_response, "output", None)
+                if _codex_response_output_is_missing(_out):
+                    recovered = _build_recovered_codex_stream_response(
+                        api_kwargs=api_kwargs,
+                        collected_output_items=collected_output_items,
+                        streamed_text_parts=agent._codex_streamed_text_parts,
+                        has_tool_calls=has_tool_calls,
+                        terminal_status=terminal_status,
+                        final_response=final_response,
+                        reason="empty final response output",
+                    )
+                if recovered is not None:
+                    final_response.output = recovered.output
+                    if getattr(final_response, "output_text", None) is None:
+                        final_response.output_text = recovered.output_text
                 _backfill_missing_codex_output(
                     agent,
                     final_response,
