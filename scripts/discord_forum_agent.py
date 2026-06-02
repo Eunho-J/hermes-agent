@@ -120,6 +120,19 @@ def list_forum_threads(token: str, forum_channel_id: str, limit: int = 100) -> l
     return threads
 
 
+def forum_tag_ids_by_name(token: str, forum_channel_id: str, names: set[str]) -> set[str]:
+    """Return forum tag IDs whose names match ``names`` case-insensitively."""
+    channel = discord_request("GET", f"/channels/{forum_channel_id}", token)
+    wanted = {name.lower() for name in names}
+    matched: set[str] = set()
+    for tag in (channel or {}).get("available_tags", []) or []:
+        tag_name = str(tag.get("name") or "").strip().lower()
+        tag_id = str(tag.get("id") or "").strip()
+        if tag_name in wanted and tag_id:
+            matched.add(tag_id)
+    return matched
+
+
 def fetch_messages(token: str, thread_id: str, limit: int = 50) -> list[dict[str, Any]]:
     messages = discord_request(
         "GET",
@@ -147,12 +160,17 @@ def select_claimable_threads(
     fetcher: Callable[[str], list[dict[str, Any]]],
     *,
     agent_name: str,
+    excluded_tag_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     processed = state.setdefault("threads", {})
+    excluded_tag_ids = excluded_tag_ids or set()
     claimable: list[dict[str, Any]] = []
     for thread in threads:
         thread_id = str(thread.get("id") or "")
         if not thread_id or processed.get(thread_id, {}).get("status") in {"claimed", "completed"}:
+            continue
+        thread_tag_ids = {str(tag_id) for tag_id in (thread.get("applied_tags") or [])}
+        if thread_tag_ids & excluded_tag_ids:
             continue
         if has_agent_claim(fetcher(thread_id), agent_name):
             continue
@@ -206,6 +224,7 @@ def run_monitor(
     token = get_bot_token()
     state = load_state(state_path)
     threads = list_forum_threads(token, forum_channel_id)
+    excluded_tag_ids = forum_tag_ids_by_name(token, forum_channel_id, {"reject", "done"})
     messages_cache: dict[str, list[dict[str, Any]]] = {}
 
     def cached_fetch(thread_id: str) -> list[dict[str, Any]]:
@@ -213,7 +232,13 @@ def run_monitor(
             messages_cache[thread_id] = fetch_messages(token, thread_id)
         return messages_cache[thread_id]
 
-    claimable = select_claimable_threads(threads, state, cached_fetch, agent_name=agent_name)
+    claimable = select_claimable_threads(
+        threads,
+        state,
+        cached_fetch,
+        agent_name=agent_name,
+        excluded_tag_ids=excluded_tag_ids,
+    )
     result = {"claimable": [str(t.get("id")) for t in claimable], "processed": [], "failed": []}
     if dry_run:
         return result

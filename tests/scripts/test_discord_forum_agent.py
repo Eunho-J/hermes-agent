@@ -39,7 +39,15 @@ def test_claim_run_post_and_mark_completed(monkeypatch, tmp_path):
     def fake_request(method, path, token, params=None, body=None, timeout=15):
         calls.append((method, path, body))
         if path == "/channels/forum":
-            return {"id": "forum", "guild_id": "guild", "type": 15}
+            return {
+                "id": "forum",
+                "guild_id": "guild",
+                "type": 15,
+                "available_tags": [
+                    {"id": "reject-tag", "name": "reject"},
+                    {"id": "done-tag", "name": "done"},
+                ],
+            }
         if path == "/guilds/guild/threads/active":
             return {"threads": [{"id": "thread1", "name": "Do thing", "parent_id": "forum"}]}
         if path == "/channels/forum/threads/archived/public":
@@ -94,6 +102,7 @@ def test_get_bot_token_reads_profile_dotenv(monkeypatch, tmp_path):
 def test_main_quiet_if_empty_suppresses_empty_output(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
     monkeypatch.setattr(agent, "list_forum_threads", lambda token, forum_channel_id: [])
+    monkeypatch.setattr(agent, "forum_tag_ids_by_name", lambda token, forum_channel_id, names: set())
 
     rc = agent.main([
         "--forum-channel-id", "forum",
@@ -112,7 +121,7 @@ def test_dry_run_does_not_post_or_spawn(monkeypatch, tmp_path):
         if method == "POST":
             posted.append(body)
         if path == "/channels/forum":
-            return {"id": "forum", "guild_id": "guild", "type": 15}
+            return {"id": "forum", "guild_id": "guild", "type": 15, "available_tags": []}
         if path == "/guilds/guild/threads/active":
             return {"threads": [{"id": "thread1", "name": "Do thing", "parent_id": "forum"}]}
         if path == "/channels/forum/threads/archived/public":
@@ -135,3 +144,39 @@ def test_dry_run_does_not_post_or_spawn(monkeypatch, tmp_path):
 
     assert result["claimable"] == ["thread1"]
     assert posted == []
+
+
+def test_select_claimable_threads_skips_excluded_tag_ids():
+    state = {"threads": {}}
+    threads = [
+        {"id": "reject", "name": "Rejected", "applied_tags": ["reject-tag"]},
+        {"id": "done", "name": "Done", "applied_tags": ["done-tag"]},
+        {"id": "open", "name": "Open", "applied_tags": ["other-tag"]},
+    ]
+
+    selected = agent.select_claimable_threads(
+        threads,
+        state,
+        lambda thread_id: [{"id": "m1", "content": "work", "author": {"bot": False}}],
+        agent_name="warp",
+        excluded_tag_ids={"reject-tag", "done-tag"},
+    )
+
+    assert [thread["id"] for thread in selected] == ["open"]
+
+
+def test_forum_tag_ids_by_name_matches_case_insensitively(monkeypatch):
+    def fake_request(method, path, token, params=None, body=None, timeout=15):
+        assert method == "GET"
+        assert path == "/channels/forum"
+        return {
+            "available_tags": [
+                {"id": "1", "name": "Reject"},
+                {"id": "2", "name": "done"},
+                {"id": "3", "name": "todo"},
+            ]
+        }
+
+    monkeypatch.setattr(agent, "discord_request", fake_request)
+
+    assert agent.forum_tag_ids_by_name("tok", "forum", {"reject", "done"}) == {"1", "2"}
