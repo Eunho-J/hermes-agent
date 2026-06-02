@@ -476,6 +476,54 @@ class TestCreateThread:
 
 
 # ---------------------------------------------------------------------------
+# Action: list_threads
+# ---------------------------------------------------------------------------
+
+class TestListThreads:
+    @patch("tools.discord_tool._discord_request")
+    def test_list_threads_fetches_active_and_archived_threads(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {
+                "threads": [
+                    {
+                        "id": "900",
+                        "name": "Active Post",
+                        "type": 11,
+                        "parent_id": "11",
+                        "message_count": 3,
+                        "member_count": 2,
+                        "thread_metadata": {"archived": False, "archive_timestamp": "2024-01-02T00:00:00Z"},
+                    }
+                ]
+            },
+            {
+                "threads": [
+                    {
+                        "id": "901",
+                        "name": "Archived Post",
+                        "type": 11,
+                        "parent_id": "11",
+                        "message_count": 1,
+                        "member_count": 1,
+                        "thread_metadata": {"archived": True, "archive_timestamp": "2024-01-01T00:00:00Z"},
+                    }
+                ]
+            },
+        ]
+
+        result = json.loads(discord_core(action="list_threads", channel_id="11", limit=10))
+
+        assert result["count"] == 2
+        assert [t["id"] for t in result["threads"]] == ["900", "901"]
+        assert result["threads"][0]["archived"] is False
+        assert result["threads"][1]["archived"] is True
+        assert mock_req.call_args_list[0].args == ("GET", "/channels/11/threads/active", "test-token")
+        assert mock_req.call_args_list[1].args == ("GET", "/channels/11/threads/archived/public", "test-token")
+        assert mock_req.call_args_list[1].kwargs == {"params": {"limit": "10"}}
+
+
+# ---------------------------------------------------------------------------
 # Actions: add_role / remove_role
 # ---------------------------------------------------------------------------
 
@@ -560,14 +608,14 @@ class TestRegistration:
         from tools.registry import registry
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == {"fetch_messages", "search_members", "create_thread"}
+        assert actions == {"fetch_messages", "search_members", "create_thread", "list_threads"}
 
     def test_admin_schema_actions(self):
         """Admin static schema should list only admin actions."""
         from tools.registry import registry
         entry = registry._tools["discord_admin"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread"}
+        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread", "list_threads"}
         assert actions == expected_admin
 
     def test_all_actions_covered(self):
@@ -591,6 +639,7 @@ class TestRegistration:
         assert "fetch_messages(channel_id)" in desc
         assert "search_members(guild_id, query)" in desc
         assert "create_thread(channel_id, name)" in desc
+        assert "list_threads(channel_id)" in desc
         # Admin actions should NOT be in core description
         assert "list_guilds()" not in desc
         assert "add_role(" not in desc
@@ -606,6 +655,7 @@ class TestRegistration:
         # Core actions should NOT be in admin description
         assert "fetch_messages(" not in desc
         assert "create_thread(" not in desc
+        assert "list_threads(" not in desc
 
     def test_handler_callable(self):
         from tools.registry import registry

@@ -454,6 +454,50 @@ def _create_thread(
     })
 
 
+def _list_threads(
+    token: str,
+    channel_id: str,
+    limit: int = 50,
+    **_kwargs: Any,
+) -> str:
+    """List active and recently archived public threads for a channel/forum."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 100))
+
+    active = _discord_request("GET", f"/channels/{channel_id}/threads/active", token)
+    archived = _discord_request(
+        "GET",
+        f"/channels/{channel_id}/threads/archived/public",
+        token,
+        params={"limit": str(limit)},
+    )
+
+    seen = set()
+    result = []
+    for payload in (active, archived):
+        for thread in (payload or {}).get("threads", []):
+            thread_id = thread.get("id")
+            if not thread_id or thread_id in seen:
+                continue
+            seen.add(thread_id)
+            metadata = thread.get("thread_metadata") or {}
+            result.append({
+                "id": thread_id,
+                "name": thread.get("name"),
+                "type": _channel_type_name(thread.get("type", 0)),
+                "parent_id": thread.get("parent_id"),
+                "archived": bool(metadata.get("archived", False)),
+                "archive_timestamp": metadata.get("archive_timestamp"),
+                "message_count": thread.get("message_count"),
+                "member_count": thread.get("member_count"),
+            })
+
+    return json.dumps({"threads": result, "count": len(result)})
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -484,11 +528,12 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "list_threads": _list_threads,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "list_threads"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -511,6 +556,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("list_threads", "(channel_id)", "list active and recently archived public threads/posts"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -532,6 +578,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "list_threads": ["channel_id"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
