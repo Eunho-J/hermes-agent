@@ -424,6 +424,26 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
     return json.dumps({"success": True, "message": f"Message {message_id} deleted."})
 
 
+def _send_message(
+    token: str,
+    channel_id: str,
+    content: str,
+    message_id: Optional[str] = None,
+    **_kwargs: Any,
+) -> str:
+    """Send a message to a Discord channel, forum post, or thread."""
+    body: Dict[str, Any] = {"content": content}
+    if message_id:
+        body["message_reference"] = {"message_id": message_id, "channel_id": channel_id}
+    msg = _discord_request("POST", f"/channels/{channel_id}/messages", token, body=body)
+    return json.dumps({
+        "success": True,
+        "message_id": msg.get("id"),
+        "channel_id": msg.get("channel_id", channel_id),
+        "content": msg.get("content", ""),
+    })
+
+
 def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
@@ -454,6 +474,29 @@ def _create_thread(
     })
 
 
+def _create_forum_post(
+    token: str,
+    channel_id: str,
+    name: str,
+    content: str,
+    auto_archive_duration: int = 1440,
+    **_kwargs: Any,
+) -> str:
+    """Create a Discord forum post with an initial message."""
+    body = {
+        "name": name,
+        "auto_archive_duration": auto_archive_duration,
+        "message": {"content": content},
+    }
+    thread = _discord_request("POST", f"/channels/{channel_id}/threads", token, body=body)
+    return json.dumps({
+        "success": True,
+        "thread_id": thread.get("id"),
+        "name": thread.get("name"),
+        "parent_id": thread.get("parent_id", channel_id),
+    })
+
+
 def _list_threads(
     token: str,
     channel_id: str,
@@ -467,7 +510,11 @@ def _list_threads(
         limit = 50
     limit = max(1, min(limit, 100))
 
-    active = _discord_request("GET", f"/channels/{channel_id}/threads/active", token)
+    channel = _discord_request("GET", f"/channels/{channel_id}", token)
+    guild_id = channel.get("guild_id") if isinstance(channel, dict) else None
+    if not guild_id:
+        return json.dumps({"error": f"Channel {channel_id} has no guild_id."})
+    active = _discord_request("GET", f"/guilds/{guild_id}/threads/active", token)
     archived = _discord_request(
         "GET",
         f"/channels/{channel_id}/threads/archived/public",
@@ -480,7 +527,7 @@ def _list_threads(
     for payload in (active, archived):
         for thread in (payload or {}).get("threads", []):
             thread_id = thread.get("id")
-            if not thread_id or thread_id in seen:
+            if not thread_id or thread_id in seen or str(thread.get("parent_id") or "") != str(channel_id):
                 continue
             seen.add(thread_id)
             metadata = thread.get("thread_metadata") or {}
@@ -527,13 +574,22 @@ _ACTIONS = {
     "pin_message": _pin_message,
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
+    "send_message": _send_message,
     "create_thread": _create_thread,
+    "create_forum_post": _create_forum_post,
     "list_threads": _list_threads,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "list_threads"})
+_CORE_ACTION_NAMES = frozenset({
+    "fetch_messages",
+    "search_members",
+    "create_thread",
+    "list_threads",
+    "send_message",
+    "create_forum_post",
+})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -555,7 +611,9 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
+    ("send_message", "(channel_id, content)", "send a message to a channel, thread, or forum post"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_forum_post", "(channel_id, name, content)", "create a forum post with an initial message"),
     ("list_threads", "(channel_id)", "list active and recently archived public threads/posts"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
@@ -577,7 +635,9 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "pin_message": ["channel_id", "message_id"],
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
+    "send_message": ["channel_id", "content"],
     "create_thread": ["channel_id", "name"],
+    "create_forum_post": ["channel_id", "name", "content"],
     "list_threads": ["channel_id"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
@@ -738,7 +798,11 @@ def _build_schema(
         },
         "name": {
             "type": "string",
-            "description": "New thread name (create_thread).",
+            "description": "New thread or forum post name (create_thread, create_forum_post).",
+        },
+        "content": {
+            "type": "string",
+            "description": "Message body (send_message, create_forum_post).",
         },
         "limit": {
             "type": "integer",
@@ -817,8 +881,14 @@ _ACTION_403_HINT = {
     "delete_message": (
         "Bot lacks MANAGE_MESSAGES permission in this channel, or cannot view the channel/message."
     ),
+    "send_message": (
+        "Bot lacks SEND_MESSAGES permission in this channel/thread, or cannot view it."
+    ),
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
+    ),
+    "create_forum_post": (
+        "Bot lacks CREATE_PUBLIC_THREADS or SEND_MESSAGES in this forum channel, or cannot view it."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -882,6 +952,7 @@ def _run_discord_action(
     message_id: str = "",
     query: str = "",
     name: str = "",
+    content: str = "",
     limit: int = 50,
     before: str = "",
     after: str = "",
@@ -919,6 +990,7 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "content": content,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -937,6 +1009,7 @@ def _run_discord_action(
             message_id=message_id,
             query=query,
             name=name,
+            content=content,
             limit=limit,
             before=before,
             after=after,
@@ -969,7 +1042,8 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
-    "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "content": "", "limit": 50, "before": "", "after": "",
+    "auto_archive_duration": 1440,
 }
 
 

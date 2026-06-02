@@ -181,6 +181,18 @@ class TestDiscordServerValidation:
         assert "error" in result
         assert "message_id" in result["error"]
 
+    def test_missing_required_content_for_send_message(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", channel_id="11"))
+        assert "error" in result
+        assert "content" in result["error"]
+
+    def test_missing_required_content_for_create_forum_post(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="create_forum_post", channel_id="11", name="Task"))
+        assert "error" in result
+        assert "content" in result["error"]
+
     def test_missing_multiple_params(self, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         result = json.loads(discord_admin_handler(action="add_role"))
@@ -476,6 +488,72 @@ class TestCreateThread:
 
 
 # ---------------------------------------------------------------------------
+# Action: send_message
+# ---------------------------------------------------------------------------
+
+class TestSendMessage:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_to_channel_or_thread(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "1002",
+            "content": "I'll take this.",
+            "channel_id": "900",
+        }
+        result = json.loads(discord_core(
+            action="send_message", channel_id="900", content="I'll take this.",
+        ))
+        assert result["success"] is True
+        assert result["message_id"] == "1002"
+        assert result["channel_id"] == "900"
+        mock_req.assert_called_once_with(
+            "POST", "/channels/900/messages", "test-token",
+            body={"content": "I'll take this."},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_with_reply_reference(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "1003", "content": "reply", "channel_id": "900"}
+        discord_core(
+            action="send_message", channel_id="900", content="reply", message_id="1002",
+        )
+        assert mock_req.call_args.kwargs["body"] == {
+            "content": "reply",
+            "message_reference": {"message_id": "1002", "channel_id": "900"},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Action: create_forum_post
+# ---------------------------------------------------------------------------
+
+class TestCreateForumPost:
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_starts_thread_with_initial_message(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "910", "name": "Claim: task", "parent_id": "11"}
+        result = json.loads(discord_core(
+            action="create_forum_post",
+            channel_id="11",
+            name="Claim: task",
+            content="warp will handle this",
+            auto_archive_duration=4320,
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "910"
+        assert result["parent_id"] == "11"
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/threads", "test-token",
+            body={
+                "name": "Claim: task",
+                "auto_archive_duration": 4320,
+                "message": {"content": "warp will handle this"},
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # Action: list_threads
 # ---------------------------------------------------------------------------
 
@@ -484,6 +562,7 @@ class TestListThreads:
     def test_list_threads_fetches_active_and_archived_threads(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         mock_req.side_effect = [
+            {"id": "11", "guild_id": "111", "type": 15},
             {
                 "threads": [
                     {
@@ -494,7 +573,13 @@ class TestListThreads:
                         "message_count": 3,
                         "member_count": 2,
                         "thread_metadata": {"archived": False, "archive_timestamp": "2024-01-02T00:00:00Z"},
-                    }
+                    },
+                    {
+                        "id": "902",
+                        "name": "Other Channel Post",
+                        "type": 11,
+                        "parent_id": "22",
+                    },
                 ]
             },
             {
@@ -518,9 +603,10 @@ class TestListThreads:
         assert [t["id"] for t in result["threads"]] == ["900", "901"]
         assert result["threads"][0]["archived"] is False
         assert result["threads"][1]["archived"] is True
-        assert mock_req.call_args_list[0].args == ("GET", "/channels/11/threads/active", "test-token")
-        assert mock_req.call_args_list[1].args == ("GET", "/channels/11/threads/archived/public", "test-token")
-        assert mock_req.call_args_list[1].kwargs == {"params": {"limit": "10"}}
+        assert mock_req.call_args_list[0].args == ("GET", "/channels/11", "test-token")
+        assert mock_req.call_args_list[1].args == ("GET", "/guilds/111/threads/active", "test-token")
+        assert mock_req.call_args_list[2].args == ("GET", "/channels/11/threads/archived/public", "test-token")
+        assert mock_req.call_args_list[2].kwargs == {"params": {"limit": "10"}}
 
 
 # ---------------------------------------------------------------------------
@@ -608,14 +694,28 @@ class TestRegistration:
         from tools.registry import registry
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == {"fetch_messages", "search_members", "create_thread", "list_threads"}
+        assert actions == {
+            "fetch_messages",
+            "search_members",
+            "create_thread",
+            "list_threads",
+            "send_message",
+            "create_forum_post",
+        }
 
     def test_admin_schema_actions(self):
         """Admin static schema should list only admin actions."""
         from tools.registry import registry
         entry = registry._tools["discord_admin"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread", "list_threads"}
+        expected_admin = set(_ACTIONS.keys()) - {
+            "fetch_messages",
+            "search_members",
+            "create_thread",
+            "list_threads",
+            "send_message",
+            "create_forum_post",
+        }
         assert actions == expected_admin
 
     def test_all_actions_covered(self):
@@ -640,6 +740,8 @@ class TestRegistration:
         assert "search_members(guild_id, query)" in desc
         assert "create_thread(channel_id, name)" in desc
         assert "list_threads(channel_id)" in desc
+        assert "send_message(channel_id, content)" in desc
+        assert "create_forum_post(channel_id, name, content)" in desc
         # Admin actions should NOT be in core description
         assert "list_guilds()" not in desc
         assert "add_role(" not in desc
@@ -656,6 +758,8 @@ class TestRegistration:
         assert "fetch_messages(" not in desc
         assert "create_thread(" not in desc
         assert "list_threads(" not in desc
+        assert "send_message(" not in desc
+        assert "create_forum_post(" not in desc
 
     def test_handler_callable(self):
         from tools.registry import registry
