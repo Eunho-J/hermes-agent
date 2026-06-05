@@ -359,6 +359,7 @@ def run_conversation(
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
+    agent._reaction_only_completed = False
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
@@ -3541,6 +3542,14 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if getattr(agent, "_reaction_only_completed", False):
+                    _turn_exit_reason = "reaction_only"
+                    final_response = ""
+                    # The native reaction is already delivered by the agent-loop
+                    # tool.  Do not ask the model for a follow-up text response;
+                    # that would turn a reaction-only answer into a normal reply.
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -4239,6 +4248,13 @@ def run_conversation(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    try:
+        from gateway.reaction_only import reaction_delivery_state_dict
+        _reaction_state = reaction_delivery_state_dict()
+        if _reaction_state:
+            result["delivery_state"] = _reaction_state
+    except Exception:
+        pass
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # If a /steer landed after the final assistant turn (no more tool

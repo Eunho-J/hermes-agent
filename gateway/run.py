@@ -6658,6 +6658,13 @@ class GatewayRunner:
         adapter = self.adapters.get(source.platform)
         if not adapter:
             return
+        try:
+            from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+            if is_reaction_only():
+                return
+            mark_visible_delivery("platform_notice")
+        except Exception:
+            pass
 
         config = getattr(self, "config", None)
         notice_delivery = "public"
@@ -8107,6 +8114,7 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _pre_agent_visible_reasons: List[str] = []
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -8579,6 +8587,7 @@ class GatewayRunner:
                                         try:
                                             _adapter = self.adapters.get(source.platform)
                                             if _adapter and source.chat_id:
+                                                _pre_agent_visible_reasons.append("pre_agent:compression_aborted_notice")
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -8603,6 +8612,7 @@ class GatewayRunner:
                                         try:
                                             _adapter = self.adapters.get(source.platform)
                                             if _adapter and source.chat_id:
+                                                _pre_agent_visible_reasons.append("pre_agent:compression_aux_fallback_notice")
                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -8650,6 +8660,7 @@ class GatewayRunner:
                     f"Type {sethome_cmd} to make this chat your home channel, "
                     f"or ignore to skip."
                 )
+                _pre_agent_visible_reasons.append("pre_agent:home_channel_notice")
                 await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
@@ -8716,6 +8727,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                trigger_event=event,
+                pre_agent_visible_reasons=_pre_agent_visible_reasons,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8743,6 +8756,12 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            _delivery_state = agent_result.get("delivery_state") or {}
+            _reaction_only_turn = (
+                isinstance(_delivery_state, dict)
+                and _delivery_state.get("mode") == "reaction_only"
+                and bool(_delivery_state.get("reaction_success"))
+            )
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -8785,10 +8804,11 @@ class GatewayRunner:
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
-            response = _normalize_empty_agent_response(
-                agent_result, response, history_len=len(history),
-            )
-            response = _sanitize_gateway_final_response(source.platform, response)
+            if not _reaction_only_turn:
+                response = _normalize_empty_agent_response(
+                    agent_result, response, history_len=len(history),
+                )
+                response = _sanitize_gateway_final_response(source.platform, response)
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -8807,7 +8827,7 @@ class GatewayRunner:
                 )
             except Exception:
                 _show_reasoning_effective = getattr(self, "_show_reasoning", False)
-            if _show_reasoning_effective and response:
+            if _show_reasoning_effective and response and not _reaction_only_turn:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -8837,13 +8857,13 @@ class GatewayRunner:
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent"):
+            if _footer_line and response and not agent_result.get("already_sent") and not _reaction_only_turn:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
-                "response": (response or "")[:500],
+                "response": ("[reaction_only]" if _reaction_only_turn else (response or "")[:500]),
             })
             
             # Check for pending process watchers (check_interval on background processes)
@@ -9047,7 +9067,7 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (not _reaction_only_turn) and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -9083,6 +9103,9 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                return None
+
+            if _reaction_only_turn:
                 return None
 
             return response
@@ -15738,6 +15761,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        trigger_event: Optional[MessageEvent] = None,
+        pre_agent_visible_reasons: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15891,6 +15916,13 @@ class GatewayRunner:
                         )
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
+                            try:
+                                from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                                if is_reaction_only():
+                                    return
+                                mark_visible_delivery("tool_progress:onboarding_hint")
+                            except Exception:
+                                pass
                             progress_queue.put(tool_progress_hint_gateway())
                             mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
@@ -15922,6 +15954,13 @@ class GatewayRunner:
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
+            try:
+                from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                if is_reaction_only():
+                    return
+                mark_visible_delivery(f"tool_progress:{tool_name or 'tool'}")
+            except Exception:
+                pass
             
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
@@ -16378,9 +16417,30 @@ class GatewayRunner:
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        _reaction_scope_token = None
+        if source.platform == Platform.DISCORD and trigger_event is not None:
+            try:
+                from gateway.reaction_only import begin_reaction_scope, mark_visible_delivery
+                _reaction_scope_token = begin_reaction_scope(
+                    event=trigger_event,
+                    adapter=_status_adapter,
+                    loop=_loop_for_step,
+                )
+                for _reason in pre_agent_visible_reasons or ():
+                    mark_visible_delivery(_reason)
+            except Exception:
+                _reaction_scope_token = None
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            try:
+                from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                if is_reaction_only():
+                    return
+                mark_visible_delivery(f"status:{event_type or 'message'}")
+            except Exception:
+                pass
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
                 event_type,
@@ -16549,6 +16609,12 @@ class GatewayRunner:
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
+                                    if text and str(text).strip():
+                                        try:
+                                            from gateway.reaction_only import mark_visible_delivery
+                                            mark_visible_delivery("stream")
+                                        except Exception:
+                                            pass
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
@@ -16557,6 +16623,14 @@ class GatewayRunner:
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                if text and str(text).strip():
+                    try:
+                        from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                        if is_reaction_only():
+                            return
+                        mark_visible_delivery("interim_assistant")
+                    except Exception:
+                        pass
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -16663,6 +16737,15 @@ class GatewayRunner:
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
                     return
+                if trigger_event is not None and getattr(trigger_event, "_hermes_reaction_only", False):
+                    return
+                try:
+                    from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                    if is_reaction_only():
+                        return
+                    mark_visible_delivery("background_review")
+                except Exception:
+                    pass
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
@@ -16679,6 +16762,8 @@ class GatewayRunner:
                 with _bg_review_pending_lock:
                     pending = list(_bg_review_pending)
                     _bg_review_pending.clear()
+                if trigger_event is not None and getattr(trigger_event, "_hermes_reaction_only", False):
+                    return
                 for queued in pending:
                     _deliver_bg_review_message(queued)
 
@@ -17097,6 +17182,8 @@ class GatewayRunner:
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
+                    "delivery_state": result.get("delivery_state"),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
@@ -17257,6 +17344,8 @@ class GatewayRunner:
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
+                "delivery_state": result_holder[0].get("delivery_state") if result_holder[0] else None,
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
@@ -17394,6 +17483,13 @@ class GatewayRunner:
                     except Exception:
                         pass
                 try:
+                    try:
+                        from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                        if is_reaction_only():
+                            continue
+                        mark_visible_delivery("long_running_notification")
+                    except Exception:
+                        pass
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
                         f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
@@ -17491,6 +17587,13 @@ class GatewayRunner:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
+                                try:
+                                    from gateway.reaction_only import is_reaction_only, mark_visible_delivery
+                                    if is_reaction_only():
+                                        continue
+                                    mark_visible_delivery("inactivity_warning")
+                                except Exception:
+                                    pass
                                 await _warn_adapter.send(
                                     source.chat_id,
                                     f"⚠️ No activity for {_elapsed_warn} min. "
@@ -17817,6 +17920,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    trigger_event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -17875,6 +17979,12 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+            if _reaction_scope_token is not None:
+                try:
+                    from gateway.reaction_only import reset_reaction_scope
+                    reset_reaction_scope(_reaction_scope_token)
+                except Exception:
+                    pass
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).

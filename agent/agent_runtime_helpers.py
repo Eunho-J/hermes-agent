@@ -1626,6 +1626,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
+    elif function_name == "respond_with_reaction":
+        from gateway.reaction_only import respond_with_reaction_tool
+        result = respond_with_reaction_tool(function_args)
+        try:
+            data = json.loads(result)
+        except Exception:
+            data = {}
+        if data.get("success") and data.get("mode") == "reaction_only":
+            setattr(agent, "_reaction_only_completed", True)
+        return result
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,

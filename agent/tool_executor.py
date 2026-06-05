@@ -54,12 +54,38 @@ logger = logging.getLogger(__name__)
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+_REACTION_TOOL_NAME = "respond_with_reaction"
+_REACTION_MIXED_BATCH_ERROR = (
+    "respond_with_reaction must be the only tool call in a turn; "
+    "mixed tool batches execute no tools."
+)
 
 
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
     return run_agent
+
+
+def _mark_reaction_visible_tool_delivery(function_name: str, function_args: dict) -> None:
+    """Fail-close reaction-only turns after direct visible-delivery tools."""
+    try:
+        from gateway.reaction_only import mark_visible_tool_delivery
+        mark_visible_tool_delivery(function_name, function_args)
+    except Exception:
+        pass
+
+
+def _append_reaction_mixed_batch_errors(messages: list, tool_calls) -> None:
+    for tc in tool_calls:
+        messages.append(make_tool_result_message(
+            tc.function.name,
+            json.dumps(
+                {"success": False, "error": _REACTION_MIXED_BATCH_ERROR},
+                ensure_ascii=False,
+            ),
+            tc.id,
+        ))
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -142,6 +168,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
+    _reaction_calls = [
+        (tc, name, args)
+        for tc, name, args, _block_result, _blocked_by_guardrail in parsed_calls
+        if name == _REACTION_TOOL_NAME
+    ]
+    if _reaction_calls and len(parsed_calls) != 1:
+        # Terminal contract: a native reaction-only response is exclusive.  If
+        # the model mixes it with any other tool, execute nothing so earlier
+        # visible-delivery tools cannot leak output in the same turn.
+        _append_reaction_mixed_batch_errors(
+            messages,
+            (tc for tc, _name, _args, _block_result, _blocked_by_guardrail in parsed_calls),
+        )
+        return
+
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
     if not agent.quiet_mode:
@@ -157,6 +198,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
+            continue
+        if name == _REACTION_TOOL_NAME:
+            # Do not emit a visible progress bubble for a tool whose entire
+            # purpose is "no visible Discord output".
             continue
         if agent.tool_progress_callback:
             try:
@@ -234,6 +279,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 pass
         start = time.time()
         try:
+            _mark_reaction_visible_tool_delivery(function_name, function_args)
             result = agent._invoke_tool(
                 function_name,
                 function_args,
@@ -384,15 +430,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
             if not blocked and agent.tool_progress_callback:
-                try:
-                    agent.tool_progress_callback(
-                        "tool.completed", function_name, None, None,
-                        duration=tool_duration, is_error=is_error,
-                        result=function_result,
-                    )
-                except Exception as cb_err:
-                    logging.debug(f"Tool progress callback error: {cb_err}")
-
+                if function_name == _REACTION_TOOL_NAME:
+                    pass
+                else:
+                    try:
+                        agent.tool_progress_callback(
+                            "tool.completed", function_name, None, None,
+                            duration=tool_duration, is_error=is_error,
+                            result=function_result,
+                        )
+                    except Exception as cb_err:
+                        logging.debug(f"Tool progress callback error: {cb_err}")
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -468,6 +516,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+    _all_tool_calls = list(assistant_message.tool_calls or [])
+    if any(tc.function.name == _REACTION_TOOL_NAME for tc in _all_tool_calls) and len(_all_tool_calls) != 1:
+        _append_reaction_mixed_batch_errors(messages, _all_tool_calls)
+        return
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -548,7 +600,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        if not _execution_blocked and agent.tool_progress_callback and function_name != _REACTION_TOOL_NAME:
             try:
                 preview = _build_tool_preview(function_name, function_args)
                 agent.tool_progress_callback("tool.started", function_name, preview, function_args)
@@ -586,6 +638,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        if not _execution_blocked and function_name != _REACTION_TOOL_NAME:
+            _mark_reaction_visible_tool_delivery(function_name, function_args)
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -689,6 +743,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == _REACTION_TOOL_NAME:
+            from gateway.reaction_only import respond_with_reaction_tool
+            function_result = respond_with_reaction_tool(function_args)
+            try:
+                _reaction_data = json.loads(function_result)
+            except Exception:
+                _reaction_data = {}
+            if _reaction_data.get("success") and _reaction_data.get("mode") == "reaction_only":
+                setattr(agent, "_reaction_only_completed", True)
+            tool_duration = time.time() - tool_start_time
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
@@ -818,7 +882,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        if not _execution_blocked and agent.tool_progress_callback and function_name != _REACTION_TOOL_NAME:
             try:
                 agent.tool_progress_callback(
                     "tool.completed", function_name, None, None,

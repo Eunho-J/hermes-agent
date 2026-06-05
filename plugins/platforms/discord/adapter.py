@@ -1333,6 +1333,11 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] add_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
+    async def send_reaction(self, event: MessageEvent, emoji: str) -> bool:
+        """Add a native Discord reaction to the triggering message."""
+        message = getattr(event, "raw_message", None)
+        return await self._add_reaction(message, emoji)
+
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
         """Remove the bot's own emoji reaction from a Discord message."""
         if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
@@ -1363,6 +1368,8 @@ class DiscordAdapter(BasePlatformAdapter):
         message = event.raw_message
         if hasattr(message, "add_reaction"):
             await self._remove_reaction(message, "👀")
+            if getattr(event, "_hermes_reaction_only", False):
+                return
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
@@ -3929,6 +3936,12 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
             return thread
         except Exception as direct_error:
+            if hasattr(message, "add_reaction"):
+                logger.info(
+                    "[%s] Auto-thread direct create failed; suppressing seed-message fallback for reaction-capable Discord turn.",
+                    self.name,
+                )
+                return None
             display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
             reason = f"Auto-threaded from mention by {display_name}"
             try:

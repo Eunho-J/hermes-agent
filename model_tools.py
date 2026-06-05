@@ -295,12 +295,18 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        try:
+            from gateway.reaction_only import reaction_capable
+            reaction_tool_capable = bool(reaction_capable())
+        except Exception:
+            reaction_tool_capable = False
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            reaction_tool_capable,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -439,6 +445,29 @@ def _compute_tool_definitions(
                         filtered_tools[i] = {"type": "function", "function": dynamic}
                         break
 
+    # Live Discord gateway-only terminal response tool.  This is deliberately
+    # not registered in _HERMES_CORE_TOOLS: it appears only when the current
+    # ContextVar-backed gateway session is a real Discord message turn and the
+    # platform tool-resolution path included Discord's default composite.
+    try:
+        from gateway.reaction_only import RESPOND_WITH_REACTION_SCHEMA, reaction_capable
+
+        _enabled = set(enabled_toolsets or [])
+        _discord_gateway_toolset = (
+            "hermes-discord" in _enabled
+            or (
+                enabled_toolsets is not None
+                and "discord" in tools_to_include
+                and "discord_admin" in tools_to_include
+            )
+        )
+        if _discord_gateway_toolset and reaction_capable():
+            if not any(t.get("function", {}).get("name") == "respond_with_reaction" for t in filtered_tools):
+                filtered_tools.append(RESPOND_WITH_REACTION_SCHEMA)
+                available_tool_names.add("respond_with_reaction")
+    except Exception:
+        pass
+
     # Strip web tool cross-references from browser_navigate description when
     # web_search / web_extract are not available.  The static schema says
     # "prefer web_search or web_extract" which causes the model to hallucinate
@@ -492,7 +521,7 @@ def _compute_tool_definitions(
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task", "respond_with_reaction"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
