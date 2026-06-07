@@ -348,6 +348,48 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
+async def test_discord_accepts_text_only_bot_name_mentions_when_required(adapter, monkeypatch):
+    """Entityless @BotName text should route when real pings are disabled."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._client.user = SimpleNamespace(id=999, name="Mr.W", display_name="Mr.W")
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content="@Mr.W hello without a parsed mention",
+        mentions=[],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello without a parsed mention"
+
+
+def test_discord_text_only_bot_name_mentions_count_for_bot_sender_filter(adapter):
+    adapter._client.user = SimpleNamespace(id=999, name="Mr.W", display_name="Mr.W")
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content="@Mr.W one turn, then close with a reaction",
+        mentions=[],
+    )
+
+    assert adapter._discord_message_mentions_self(message) is True
+
+
+def test_discord_text_only_bot_name_mention_does_not_match_email_or_prefix(adapter):
+    adapter._client.user = SimpleNamespace(id=999, name="Mr.W", display_name="Mr.W")
+
+    assert adapter._discord_message_mentions_self(
+        make_message(channel=FakeTextChannel(channel_id=321), content="ping@Mr.W", mentions=[])
+    ) is False
+    assert adapter._discord_message_mentions_self(
+        make_message(channel=FakeTextChannel(channel_id=321), content="@Mr.Warp hello", mentions=[])
+    ) is False
+
+
+@pytest.mark.asyncio
 async def test_discord_dms_ignore_mention_requirement(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -882,5 +924,4 @@ async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
     if adapter.handle_message.await_args is not None:
         event = adapter.handle_message.await_args.args[0]
         assert event.channel_context is None
-
 

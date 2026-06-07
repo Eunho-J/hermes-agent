@@ -752,7 +752,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                        if not adapter_self._discord_message_mentions_self(message):
                             return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
@@ -781,10 +781,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # with bot-aware filtering that works correctly when multiple
                 # agents share a channel.
                 if not isinstance(message.channel, discord.DMChannel) and message.mentions:
-                    _self_mentioned = (
-                        self._client.user is not None
-                        and self._client.user in message.mentions
-                    )
+                    _self_mentioned = adapter_self._discord_message_mentions_self(message)
                     _other_bots_mentioned = any(
                         m.bot and m != self._client.user
                         for m in message.mentions
@@ -3689,6 +3686,72 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_self_mention_names(self) -> list[str]:
+        """Return human-readable names that may address this bot in text.
+
+        ``message.mentions`` is the authoritative Discord signal, but Hermes
+        deployments commonly set ``discord.allow_mentions.users: false`` to
+        avoid real pings from LLM output.  In that mode a bot can still write
+        ``@Mr.W`` / ``@Javala`` as conversational routing text, while Discord
+        may not populate ``message.mentions``.  Treat those display-name tokens
+        as mention equivalents for gateway routing only.
+        """
+        user = getattr(getattr(self, "_client", None), "user", None)
+        names: list[str] = []
+        for attr in ("display_name", "global_name", "name"):
+            value = str(getattr(user, attr, "") or "").strip()
+            if value and value not in names:
+                names.append(value)
+        return names
+
+    def _discord_message_mentions_self(self, message: Any) -> bool:
+        """Return True when *message* addresses this Discord bot.
+
+        Supports both Discord-native mentions and text-only mention fallbacks
+        used when outgoing user mentions are intentionally disabled.
+        """
+        user = getattr(getattr(self, "_client", None), "user", None)
+        if user is None:
+            return False
+        try:
+            if user in (getattr(message, "mentions", None) or []):
+                return True
+        except Exception:
+            pass
+
+        user_id = str(getattr(user, "id", "") or "").strip()
+        text = "\n".join(
+            str(getattr(message, attr, "") or "")
+            for attr in ("content", "clean_content")
+            if getattr(message, attr, None)
+        )
+        if not text:
+            return False
+        if user_id and re.search(rf"<@!?{re.escape(user_id)}>", text):
+            return True
+
+        for name in self._discord_self_mention_names():
+            pattern = rf"(?<!\S)@{re.escape(name)}(?=$|[\s,;:!?.)\]}}])"
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return True
+        return False
+
+    def _discord_strip_self_mention(self, content: str) -> str:
+        """Remove this bot's Discord-native or text-only mention."""
+        user = getattr(getattr(self, "_client", None), "user", None)
+        result = str(content or "")
+        user_id = str(getattr(user, "id", "") or "").strip()
+        if user_id:
+            result = re.sub(rf"<@!?{re.escape(user_id)}>", "", result)
+        for name in self._discord_self_mention_names():
+            result = re.sub(
+                rf"(?<!\S)@{re.escape(name)}(?=$|[\s,;:!?.)\]}}])",
+                "",
+                result,
+                flags=re.IGNORECASE,
+            )
+        return result.strip()
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -4502,10 +4565,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
-        if self._client.user and self._client.user in message.mentions:
+        if self._discord_message_mentions_self(message):
             mention_prefix = True
-            normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
-            normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            normalized_content = self._discord_strip_self_mention(normalized_content)
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -4555,7 +4617,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if self._client.user not in message.mentions and not mention_prefix:
+                if not self._discord_message_mentions_self(message) and not mention_prefix:
                     return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
