@@ -120,26 +120,28 @@ def test_reaction_tool_schema_only_appears_for_live_discord_session(monkeypatch)
     event = _event(raw_message)
 
     _clear_tool_defs_cache()
-    no_session_tools = get_tool_definitions(["discord", "discord_admin"], quiet_mode=True)
+    no_session_tools = get_tool_definitions(["messaging"], quiet_mode=True)
     assert "respond_with_reaction" not in {t["function"]["name"] for t in no_session_tools}
 
     session_tokens = set_session_vars(platform="discord", chat_id="chan-1", message_id="msg-1")
     scope_token = begin_reaction_scope(event=event, adapter=adapter, loop=None)
     try:
         _clear_tool_defs_cache()
-        tools = get_tool_definitions(["discord", "discord_admin"], quiet_mode=True)
+        tools = get_tool_definitions(["messaging"], quiet_mode=True)
     finally:
         reset_reaction_scope(scope_token)
         clear_session_vars(session_tokens)
         _clear_tool_defs_cache()
 
     assert "respond_with_reaction" in {t["function"]["name"] for t in tools}
+    assert "discord" not in {t["function"]["name"] for t in tools}
+    assert "discord_admin" not in {t["function"]["name"] for t in tools}
 
     _clear_tool_defs_cache()
     session_tokens = set_session_vars(platform="discord", chat_id="chan-1", message_id="msg-1")
     scope_token = begin_reaction_scope(event=event, adapter=adapter, loop=None)
     try:
-        live_tools = get_tool_definitions(["discord", "discord_admin"], quiet_mode=True)
+        live_tools = get_tool_definitions(["messaging"], quiet_mode=True)
         assert "respond_with_reaction" in {t["function"]["name"] for t in live_tools}
     finally:
         reset_reaction_scope(scope_token)
@@ -147,7 +149,7 @@ def test_reaction_tool_schema_only_appears_for_live_discord_session(monkeypatch)
 
     # Regression guard: quiet-mode tool-definition caching must not leak the
     # live Discord-only reaction tool into later non-Discord/non-root contexts.
-    cached_after_scope = get_tool_definitions(["discord", "discord_admin"], quiet_mode=True)
+    cached_after_scope = get_tool_definitions(["messaging"], quiet_mode=True)
     assert "respond_with_reaction" not in {t["function"]["name"] for t in cached_after_scope}
     _clear_tool_defs_cache()
 

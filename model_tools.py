@@ -447,21 +447,16 @@ def _compute_tool_definitions(
 
     # Live Discord gateway-only terminal response tool.  This is deliberately
     # not registered in _HERMES_CORE_TOOLS: it appears only when the current
-    # ContextVar-backed gateway session is a real Discord message turn and the
-    # platform tool-resolution path included Discord's default composite.
+    # ContextVar-backed gateway session is a real Discord message turn.
+    #
+    # Do not tie this to the ``discord`` / ``discord_admin`` toolsets.  Those
+    # expose Discord read/admin actions and users often disable them while
+    # still expecting the gateway itself to support native delivery affordances
+    # such as "react to the triggering message instead of sending text".
     try:
         from gateway.reaction_only import RESPOND_WITH_REACTION_SCHEMA, reaction_capable
 
-        _enabled = set(enabled_toolsets or [])
-        _discord_gateway_toolset = (
-            "hermes-discord" in _enabled
-            or (
-                enabled_toolsets is not None
-                and "discord" in tools_to_include
-                and "discord_admin" in tools_to_include
-            )
-        )
-        if _discord_gateway_toolset and reaction_capable():
+        if reaction_capable():
             if not any(t.get("function", {}).get("name") == "respond_with_reaction" for t in filtered_tools):
                 filtered_tools.append(RESPOND_WITH_REACTION_SCHEMA)
                 available_tool_names.add("respond_with_reaction")
