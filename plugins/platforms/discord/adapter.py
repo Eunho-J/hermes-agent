@@ -747,11 +747,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
-                if getattr(message.author, "bot", False):
-                    allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-                    if allow_bots == "none":
+                _author_is_bot = bool(getattr(message.author, "bot", False))
+                _allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                if _author_is_bot:
+                    if _allow_bots == "none":
                         return
-                    elif allow_bots == "mentions":
+                    elif _allow_bots == "mentions":
                         if not adapter_self._discord_message_mentions_self(message):
                             return
                     # "all" falls through; bot is permitted — skip the
@@ -780,7 +781,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 # This replaces the older DISCORD_IGNORE_NO_MENTION logic
                 # with bot-aware filtering that works correctly when multiple
                 # agents share a channel.
-                if not isinstance(message.channel, discord.DMChannel) and message.mentions:
+                if (
+                    not isinstance(message.channel, discord.DMChannel)
+                    and message.mentions
+                    and not (_author_is_bot and _allow_bots == "all")
+                ):
                     _self_mentioned = adapter_self._discord_message_mentions_self(message)
                     _other_bots_mentioned = any(
                         m.bot and m != self._client.user
@@ -4616,7 +4621,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            bot_messages_unrestricted = (
+                bool(getattr(message.author, "bot", False))
+                and os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip() == "all"
+            )
+            if (
+                require_mention
+                and not is_free_channel
+                and not in_bot_thread
+                and not bot_messages_unrestricted
+            ):
                 if not self._discord_message_mentions_self(message) and not mention_prefix:
                     return
         # Auto-thread: when enabled, automatically create a thread for every

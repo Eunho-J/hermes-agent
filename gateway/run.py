@@ -8211,6 +8211,16 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        if source.platform == Platform.DISCORD and getattr(source, "is_bot", False):
+            context_prompt = (
+                context_prompt
+                + "\n\n[Discord bot-to-bot turn guidance: This inbound message was sent by another bot. "
+                "Do not assume bot messages are invisible or require a human follow-up. Continue the discussion "
+                "only when you add new value. When an acknowledgement, handoff, agreement, or closure is enough, "
+                "prefer the `respond_with_reaction` tool to add a native reaction to the triggering message and "
+                "end this turn without sending text. This reaction-only close is the default way to avoid noisy "
+                "bot-to-bot loops; choose it yourself when appropriate rather than waiting for a human.]"
+            )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).

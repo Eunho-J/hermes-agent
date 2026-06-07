@@ -367,6 +367,28 @@ async def test_discord_accepts_text_only_bot_name_mentions_when_required(adapter
     assert event.text == "hello without a parsed mention"
 
 
+@pytest.mark.asyncio
+async def test_discord_allow_bots_all_processes_bot_message_without_mention(adapter, monkeypatch):
+    """Bot discussion mode should let the model decide how to close the turn."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content="handoff accepted; your turn",
+        mentions=[],
+    )
+    message.author = SimpleNamespace(id=777, display_name="OtherBot", name="OtherBot", bot=True)
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "handoff accepted; your turn"
+    assert event.source.is_bot is True
+
+
 def test_discord_text_only_bot_name_mentions_count_for_bot_sender_filter(adapter):
     adapter._client.user = SimpleNamespace(id=999, name="Mr.W", display_name="Mr.W")
     message = make_message(
@@ -924,4 +946,3 @@ async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
     if adapter.handle_message.await_args is not None:
         event = adapter.handle_message.await_args.args[0]
         assert event.channel_context is None
-
