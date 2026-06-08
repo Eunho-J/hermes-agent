@@ -180,3 +180,50 @@ def test_forum_tag_ids_by_name_matches_case_insensitively(monkeypatch):
     monkeypatch.setattr(agent, "discord_request", fake_request)
 
     assert agent.forum_tag_ids_by_name("tok", "forum", {"reject", "done"}) == {"1", "2"}
+
+
+def test_select_claimable_threads_requires_target_mention():
+    state = {"threads": {}}
+    threads = [
+        {"id": "for-javala", "name": "For Javala"},
+        {"id": "for-warp", "name": "For Warp"},
+    ]
+    messages_by_thread = {
+        "for-javala": [
+            {
+                "id": "m1",
+                "content": "<@1488550646100529275> 새 토픽 여기야. 지금 warp 태그하지 말고",
+                "author": {"bot": False, "username": "Cayde"},
+                "mentions": [{"id": "1488550646100529275", "username": "Javala"}],
+            }
+        ],
+        "for-warp": [
+            {
+                "id": "m2",
+                "content": "<@1477588630523609202> 이건 네가 처리해",
+                "author": {"bot": False, "username": "Cayde"},
+                "mentions": [{"id": "1477588630523609202", "username": "Mr.W"}],
+            }
+        ],
+    }
+
+    selected = agent.select_claimable_threads(
+        threads,
+        state,
+        lambda thread_id: messages_by_thread.get(thread_id, []),
+        agent_name="warp",
+        target_user_id="1477588630523609202",
+    )
+
+    assert [thread["id"] for thread in selected] == ["for-warp"]
+
+
+def test_build_prompt_instructs_agent_to_respect_existing_thread_context():
+    prompt = agent.build_prompt(
+        {"id": "thread1", "name": "Discussion"},
+        "Cayde: <@1488550646100529275> 지금 warp 태그하지 말고",
+        "warp",
+    )
+
+    assert "entire existing transcript" in prompt
+    assert "Do not treat work as assigned to you unless the transcript explicitly targets this profile" in prompt

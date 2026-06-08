@@ -154,12 +154,28 @@ def has_agent_claim(messages: list[dict[str, Any]], agent_name: str) -> bool:
     return False
 
 
+def transcript_mentions_user(messages: list[dict[str, Any]], user_id: str) -> bool:
+    """Return whether any message in the transcript explicitly mentions ``user_id``."""
+    target = str(user_id).strip()
+    if not target:
+        return False
+    for msg in messages:
+        for mention in (msg.get("mentions") or []):
+            if str(mention.get("id") or "") == target:
+                return True
+        content = str(msg.get("content") or "")
+        if f"<@{target}>" in content or f"<@!{target}>" in content:
+            return True
+    return False
+
+
 def select_claimable_threads(
     threads: list[dict[str, Any]],
     state: dict[str, Any],
     fetcher: Callable[[str], list[dict[str, Any]]],
     *,
     agent_name: str,
+    target_user_id: str | None = None,
     excluded_tag_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     processed = state.setdefault("threads", {})
@@ -172,7 +188,10 @@ def select_claimable_threads(
         thread_tag_ids = {str(tag_id) for tag_id in (thread.get("applied_tags") or [])}
         if thread_tag_ids & excluded_tag_ids:
             continue
-        if has_agent_claim(fetcher(thread_id), agent_name):
+        messages = fetcher(thread_id)
+        if target_user_id and not transcript_mentions_user(messages, target_user_id):
+            continue
+        if has_agent_claim(messages, agent_name):
             continue
         claimable.append(thread)
     return claimable
@@ -196,7 +215,9 @@ def build_prompt(thread: dict[str, Any], transcript: str, agent_name: str) -> st
     return (
         f"You are Hermes profile {agent_name}. A Discord forum post has been claimed for autonomous work.\n"
         f"Thread title: {thread.get('name') or thread.get('id')}\n\n"
-        "Read the transcript, perform the requested work using available tools, and return a concise final result. "
+        "Read the entire existing transcript before acting, including earlier messages that may define who the work is for. "
+        "Do not treat work as assigned to you unless the transcript explicitly targets this profile; if it targets another bot/profile, stop and say so. "
+        "Perform the requested work using available tools only when it is actually assigned to you, and return a concise final result. "
         "Do not schedule another cron job.\n\n"
         f"Transcript:\n{transcript}"
     )
@@ -217,6 +238,7 @@ def run_monitor(
     state_path: Path,
     profile: str,
     agent_name: str,
+    target_user_id: str | None = None,
     max_tasks: int = 1,
     dry_run: bool = False,
     hermes_timeout: int = 1800,
@@ -229,7 +251,7 @@ def run_monitor(
 
     def cached_fetch(thread_id: str) -> list[dict[str, Any]]:
         if thread_id not in messages_cache:
-            messages_cache[thread_id] = fetch_messages(token, thread_id)
+            messages_cache[thread_id] = fetch_messages(token, thread_id, limit=100)
         return messages_cache[thread_id]
 
     claimable = select_claimable_threads(
@@ -237,6 +259,7 @@ def run_monitor(
         state,
         cached_fetch,
         agent_name=agent_name,
+        target_user_id=target_user_id,
         excluded_tag_ids=excluded_tag_ids,
     )
     result = {"claimable": [str(t.get("id")) for t in claimable], "processed": [], "failed": []}
@@ -273,6 +296,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--state-path", type=Path, default=Path(os.getenv("DISCORD_FORUM_AGENT_STATE", DEFAULT_STATE_PATH)))
     parser.add_argument("--profile", default=os.getenv("HERMES_FORUM_AGENT_PROFILE", "warp"))
     parser.add_argument("--agent-name", default=os.getenv("HERMES_FORUM_AGENT_NAME", "warp"))
+    parser.add_argument("--target-user-id", default=os.getenv("HERMES_FORUM_AGENT_TARGET_USER_ID", ""))
     parser.add_argument("--max-tasks", type=int, default=int(os.getenv("HERMES_FORUM_AGENT_MAX_TASKS", "1")))
     parser.add_argument("--hermes-timeout", type=int, default=int(os.getenv("HERMES_FORUM_AGENT_TIMEOUT", "1800")))
     parser.add_argument("--dry-run", action="store_true")
@@ -289,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path=args.state_path,
         profile=args.profile,
         agent_name=args.agent_name,
+        target_user_id=args.target_user_id or None,
         max_tasks=args.max_tasks,
         dry_run=args.dry_run,
         hermes_timeout=args.hermes_timeout,
