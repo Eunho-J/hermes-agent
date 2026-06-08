@@ -86,8 +86,7 @@ def test_claim_run_post_and_mark_completed(monkeypatch, tmp_path):
     saved = json.loads(state_path.read_text())
     assert saved["threads"]["thread1"]["status"] == "completed"
     posted_bodies = [body["content"] for method, path, body in calls if method == "POST"]
-    assert any("Claimed by warp" in body for body in posted_bodies)
-    assert any("done" in body for body in posted_bodies)
+    assert posted_bodies == ["done"]
 
 
 def test_get_bot_token_reads_profile_dotenv(monkeypatch, tmp_path):
@@ -180,3 +179,75 @@ def test_forum_tag_ids_by_name_matches_case_insensitively(monkeypatch):
     monkeypatch.setattr(agent, "discord_request", fake_request)
 
     assert agent.forum_tag_ids_by_name("tok", "forum", {"reject", "done"}) == {"1", "2"}
+
+
+def test_run_monitor_reevaluates_completed_thread_when_new_message_arrives(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "threads": {"thread1": {"status": "completed", "last_seen_message_id": "old"}}
+    }))
+
+    def fake_request(method, path, token, params=None, body=None, timeout=15):
+        if path == "/channels/forum":
+            return {"id": "forum", "guild_id": "guild", "available_tags": []}
+        if path == "/guilds/guild/threads/active":
+            return {"threads": [{"id": "thread1", "name": "Existing", "parent_id": "forum"}]}
+        if path == "/channels/forum/threads/archived/public":
+            return {"threads": []}
+        if path == "/channels/thread1/messages" and method == "GET":
+            return [
+                {"id": "new", "content": "<@1477588630523609202> do this now", "author": {"bot": False, "username": "Cayde"}},
+                {"id": "old", "content": "old context", "author": {"bot": False, "username": "Cayde"}},
+            ]
+        if path == "/channels/thread1/messages" and method == "POST":
+            return {"id": "posted", "content": body["content"]}
+        raise AssertionError((method, path, body))
+
+    def fake_run(cmd, text, capture_output, timeout):
+        assert "old context" in cmd[-1]
+        assert "do this now" in cmd[-1]
+        return subprocess.CompletedProcess(cmd, 0, stdout="done", stderr="")
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+    monkeypatch.setattr(agent, "discord_request", fake_request)
+    monkeypatch.setattr(agent.subprocess, "run", fake_run)
+
+    result = agent.run_monitor(forum_channel_id="forum", state_path=state_path, profile="warp", agent_name="warp")
+
+    assert result["processed"] == ["thread1"]
+    saved = json.loads(state_path.read_text())
+    assert saved["threads"]["thread1"]["last_seen_message_id"] == "new"
+
+
+def test_run_monitor_posts_nothing_when_agent_judges_no_action(monkeypatch, tmp_path):
+    posted = []
+
+    def fake_request(method, path, token, params=None, body=None, timeout=15):
+        if path == "/channels/forum":
+            return {"id": "forum", "guild_id": "guild", "available_tags": []}
+        if path == "/guilds/guild/threads/active":
+            return {"threads": [{"id": "thread1", "name": "For another bot", "parent_id": "forum"}]}
+        if path == "/channels/forum/threads/archived/public":
+            return {"threads": []}
+        if path == "/channels/thread1/messages" and method == "GET":
+            return [{"id": "m1", "content": "<@1488550646100529275> Javala do this", "author": {"bot": False, "username": "Cayde"}}]
+        if path == "/channels/thread1/messages" and method == "POST":
+            posted.append(body["content"])
+            return {"id": "posted"}
+        raise AssertionError((method, path, body))
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+    monkeypatch.setattr(agent, "discord_request", fake_request)
+    monkeypatch.setattr(agent.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout="NO_ACTION", stderr=""))
+
+    result = agent.run_monitor(forum_channel_id="forum", state_path=tmp_path / "state.json", profile="warp", agent_name="warp")
+
+    assert result["ignored"] == ["thread1"]
+    assert posted == []
+
+
+def test_build_prompt_requires_judgment_not_algorithmic_mention_gate():
+    prompt = agent.build_prompt({"id": "thread1", "name": "Discussion"}, "Cayde: discuss this", "warp")
+
+    assert "First judge from the full transcript" in prompt
+    assert "If there is no request for this profile, return exactly NO_ACTION" in prompt

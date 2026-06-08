@@ -3,10 +3,10 @@
 
 The monitor is intentionally small and stateful:
 - list active/recently archived forum posts;
-- skip posts already recorded in state;
-- skip posts that already contain a bot claim for this agent;
-- post a claim, run Hermes once with the post transcript, then post the result;
-- persist completion/failure state so cron reruns do not duplicate work.
+- review every active/recent forum post that has new messages;
+- pass the full transcript to Hermes so it can judge whether the request is for this profile;
+- post only when Hermes decides there is actionable work for this profile;
+- persist the last seen message so cron reruns do not duplicate work.
 """
 
 from __future__ import annotations
@@ -154,6 +154,28 @@ def has_agent_claim(messages: list[dict[str, Any]], agent_name: str) -> bool:
     return False
 
 
+def latest_message_id(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    return str(messages[-1].get("id") or "")
+
+
+def thread_needs_review(thread: dict[str, Any], state: dict[str, Any], messages: list[dict[str, Any]], agent_name: str) -> bool:
+    thread_id = str(thread.get("id") or "")
+    if not thread_id or not messages:
+        return False
+    entry = state.setdefault("threads", {}).get(thread_id, {})
+    last_seen = str(entry.get("last_seen_message_id") or "")
+    latest = latest_message_id(messages)
+    if last_seen:
+        return latest != last_seen
+    if entry.get("status") == "claimed":
+        return False
+    if not entry and has_agent_claim(messages, agent_name):
+        return False
+    return True
+
+
 def select_claimable_threads(
     threads: list[dict[str, Any]],
     state: dict[str, Any],
@@ -167,12 +189,13 @@ def select_claimable_threads(
     claimable: list[dict[str, Any]] = []
     for thread in threads:
         thread_id = str(thread.get("id") or "")
-        if not thread_id or processed.get(thread_id, {}).get("status") in {"claimed", "completed"}:
+        if not thread_id:
             continue
         thread_tag_ids = {str(tag_id) for tag_id in (thread.get("applied_tags") or [])}
         if thread_tag_ids & excluded_tag_ids:
             continue
-        if has_agent_claim(fetcher(thread_id), agent_name):
+        messages = fetcher(thread_id)
+        if not thread_needs_review(thread, state, messages, agent_name):
             continue
         claimable.append(thread)
     return claimable
@@ -194,9 +217,12 @@ def format_transcript(messages: list[dict[str, Any]]) -> str:
 
 def build_prompt(thread: dict[str, Any], transcript: str, agent_name: str) -> str:
     return (
-        f"You are Hermes profile {agent_name}. A Discord forum post has been claimed for autonomous work.\n"
+        f"You are Hermes profile {agent_name}. A Discord forum post is being checked for possible autonomous work.\n"
         f"Thread title: {thread.get('name') or thread.get('id')}\n\n"
-        "Read the transcript, perform the requested work using available tools, and return a concise final result. "
+        "First judge from the full transcript whether there is an instruction or request for this profile. "
+        "Use mentions, addressee wording, and prior context as evidence; do not rely on a single keyword or tag alone. "
+        "If there is no request for this profile, return exactly NO_ACTION and nothing else. "
+        "If there is a request for this profile, perform the requested work using available tools and return a concise final result. "
         "Do not schedule another cron job.\n\n"
         f"Transcript:\n{transcript}"
     )
@@ -229,7 +255,7 @@ def run_monitor(
 
     def cached_fetch(thread_id: str) -> list[dict[str, Any]]:
         if thread_id not in messages_cache:
-            messages_cache[thread_id] = fetch_messages(token, thread_id)
+            messages_cache[thread_id] = fetch_messages(token, thread_id, limit=100)
         return messages_cache[thread_id]
 
     claimable = select_claimable_threads(
@@ -239,28 +265,29 @@ def run_monitor(
         agent_name=agent_name,
         excluded_tag_ids=excluded_tag_ids,
     )
-    result = {"claimable": [str(t.get("id")) for t in claimable], "processed": [], "failed": []}
+    result = {"claimable": [str(t.get("id")) for t in claimable], "processed": [], "ignored": [], "failed": []}
     if dry_run:
         return result
 
     for thread in claimable[: max(1, max_tasks)]:
         thread_id = str(thread["id"])
-        now = int(time.time())
-        state.setdefault("threads", {})[thread_id] = {"status": "claimed", "claimed_at": now, "name": thread.get("name")}
-        save_state(state_path, state)
-        send_message(token, thread_id, f"Claimed by {agent_name}; running autonomous work now.")
-        transcript = format_transcript(cached_fetch(thread_id))
+        messages = cached_fetch(thread_id)
+        latest_id = latest_message_id(messages)
+        transcript = format_transcript(messages)
         prompt = build_prompt(thread, transcript, agent_name)
         completed = run_hermes(profile, prompt, hermes_timeout)
         output = (completed.stdout or completed.stderr or "").strip()
-        if completed.returncode == 0:
-            state["threads"][thread_id].update({"status": "completed", "completed_at": int(time.time())})
+        entry = state.setdefault("threads", {}).setdefault(thread_id, {"name": thread.get("name")})
+        entry.update({"name": thread.get("name"), "last_seen_message_id": latest_id})
+        if completed.returncode == 0 and output == "NO_ACTION":
+            entry.update({"status": "ignored", "ignored_at": int(time.time())})
+            result["ignored"].append(thread_id)
+        elif completed.returncode == 0:
             send_message(token, thread_id, output or f"{agent_name} completed this task.")
+            entry.update({"status": "completed", "completed_at": int(time.time())})
             result["processed"].append(thread_id)
         else:
-            state["threads"][thread_id].update(
-                {"status": "failed", "failed_at": int(time.time()), "returncode": completed.returncode}
-            )
+            entry.update({"status": "failed", "failed_at": int(time.time()), "returncode": completed.returncode})
             send_message(token, thread_id, f"{agent_name} failed to complete this task.\n\n{output}")
             result["failed"].append(thread_id)
         save_state(state_path, state)
